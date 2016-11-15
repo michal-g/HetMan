@@ -456,7 +456,7 @@ class MuTree(object):
                     for kc in combn(subs, csize):
                         new_set = reduce(lambda x,y: x | y, kc)
                         set_size = len(self.get_samples(new_set))
-                        if (set_size >= min((tot_samps*prop_use), 5) and
+                        if (set_size >= max((tot_samps*prop_use), 5) and
                             set_size <= (tot_samps*(1-prop_use))):
                             psets += [new_set]
             psets = set(psets) - set(exclude_parts)
@@ -869,7 +869,7 @@ class MutExpr(object):
         if self.train_samps_ is None:
             raise HetmanError("No testing set defined!")
         return (self.test_expr_,
-                self.test_mut.status(self.test_expr_.index, mset))
+                self.test_mut_.status(self.test_expr_.index, mset))
 
     def test_classif_cv(self,
                         classif, mset=None,
@@ -903,6 +903,9 @@ class MutExpr(object):
             The 1st quartile of tuned classifier performance across the
             cross-validation samples. Used instead of the mean of performance
             to take into account performance variation for "hard" samples.
+
+            Performance is measured using the area under the receiver operator
+            curve metric.
         """
         train_expr,train_mut,train_cv = self.training(mset)
         test_cvs = [x for i,x in enumerate(train_cv)
@@ -910,10 +913,44 @@ class MutExpr(object):
         if tune_indx is not None:
             tune_cvs = [x for i,x in enumerate(train_cv)
                         if i in tune_indx]
-            classif.tune(train_expr, train_mut, tune_cvs, verbose)
+            classif.tune(expr=train_expr, mut=train_mut,
+                         cv_samples=tune_cvs, test_count='auto',
+                         verbose=verbose)
 
         return np.percentile(model_selection.cross_val_score(
                 estimator=classif, X=train_expr, y=train_mut,
                 scoring=_score_auc, cv=test_cvs, n_jobs=-1
             ), 25)
+
+    def test_classif_base(self, classif, tune_indx=range(5), mset=None):
+        """Test a classifier using by tuning within the training samples,
+           training on all of them, and then testing on the testing samples.
+
+        Parameters
+        ----------
+        classif : MutClassifier
+            The classifier to test.
+
+        mset : MutSet, optional
+            The mutation sub-type to test the classifier on.
+            Default is to use all of the mutations available.
+
+        tune_indx : list of ints, optional
+            Which of the internal cross-validation samples to use for tuning
+            the hyper-parameters of the given classifier.
+
+        Returns
+        -------
+        P : float
+            Performance of the classifier on the testing samples as measured
+            using the AUC ROC metric.
+        """
+        train_expr,train_mut,train_cv = self.training(mset)
+        test_expr,test_mut = self.testing(mset)
+        if tune_indx is not None:
+            tune_cvs = [x for i,x in enumerate(train_cv)
+                        if i in tune_indx]
+            classif.tune(train_expr, train_mut, tune_cvs)
+        classif.fit(train_expr, train_mut)
+        return _score_auc(classif, test_expr, test_mut)
 
