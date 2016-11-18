@@ -13,6 +13,7 @@ import pandas as pd
 import re
 
 from itertools import combinations as combn
+from itertools import groupby
 from math import log
 from sklearn import model_selection
 from hetman_classif import _score_auc
@@ -24,16 +25,19 @@ _data_dir = _base_dir + 'input-data/ICGC/raw/'
 _cv_dir = _base_dir + 'auxiliary/HetMan/cv-samples/'
 
 
-# .. helper function for reading in gene annotation data ..
+# .. helper functions for reading in genomic data from files downloaded
+#    via the ICGC portal and GENCODE ..
 def _read_annot(version='v19'):
     """Gets annotation data for protein-coding genes on non-sex
        chromosomes from a Gencode file.
 
     Parameters
     ----------
-    version : str, 'v*' optional
+    version : str, 'v*', optional (default='v19')
         Which version of the Gencode data to use, must correspond
         to a file in input-data/.
+        Default is to use v19, which matches what is used for the data
+        available at the ICGC data portal (11/09/2016).
 
     Returns
     -------
@@ -42,14 +46,13 @@ def _read_annot(version='v19'):
         consisting of dicts with annotation fields.
     """
     dt = np.dtype(
-        [('Chr', 'a64'),
-         ('Type', 'a64'),
-         ('Annot', 'a2048')]
+        [('Chr', 'a64'), ('Type', 'a64'),
+         ('Start', 'i4'), ('End', 'i4'), ('Annot', 'a2048')]
         )
     annot = np.loadtxt(
         fname=(_base_dir + 'input-data/gencode.'
                + version + '.annotation.gtf.gz'),
-        dtype=dt, usecols=(0,2,8), delimiter='\t'
+        dtype=dt, usecols=(0,2,3,4,8), delimiter='\t'
         )
 
     # filter out annotation records that aren't
@@ -58,8 +61,11 @@ def _read_annot(version='v19'):
     annot = annot[annot['Type'] == 'gene']
     annot = annot[np.array([chrom in chroms_use for chrom in annot['Chr']])]
     gene_annot = {
-        re.sub('\.[0-9]+', '', z['gene_id']).replace('"', ''):z
+        re.sub('\.[0-9]+', '', z['gene_id']).replace('"',
+                                                     ''):z
         for z in [dict([['chr', an['Chr']]] +
+                       [['Start', an['Start']]] +
+                       [['End', an['End']]] +
                        [y for y in [x.split(' ')
                                     for x in an['Annot'].split('; ')]
                         if len(y) == 2])
@@ -70,6 +76,85 @@ def _read_annot(version='v19'):
     for g in gene_annot:
         gene_annot[g]['gene_name'] = gene_annot[g]['gene_name'].replace('"', '')
     return gene_annot
+
+
+def _read_expr(expr_file):
+    """Gets expression data as a matrix from an ICGC tsv.gz file.
+
+    Parameters
+    ----------
+    expr_file : str
+        A file containing expression data.
+
+    Returns
+    -------
+    expr : array-like, shape (n_samples, n_features)
+        An expression matrix with genes as features, in the case of duplicate
+        gene names values are averaged.
+    """
+    expr = pd.read_table(
+            expr_file,
+            usecols=(0,7,8), header=0,
+            names=('Sample', 'Gene', 'FPKM'),
+            dtype={'Sample':'a64', 'Gene':'a64', 'FPKM':'f4'}
+            )
+    expr = expr.pivot_table(
+            index='Sample', columns='Gene',
+            values='FPKM', aggfunc=np.mean
+            )
+    return expr
+
+
+def _read_mut(mut_file):
+    """Gets mutation data as an numpy array from an ICGC tsv.gz file.
+
+    Parameters
+    ----------
+    mut_file : str
+        A file containing mutation data.
+
+    Returns
+    -------
+    mut : array-like, shape (n_mutations,)
+        A 1-D array with each entry corresponding to a single mutation
+        affecting a single transcript in a single sample.
+    """
+    mut_dt = np.dtype(
+        [('Name', np.str_, 16), ('Sample', np.str_, 16),
+         ('Position', np.int), ('Consequence', np.str_, 46),
+         ('Protein', np.str_, 16), ('Gene', np.str_, 16),
+         ('Transcript', np.str_, 16)]
+        )
+    mut = np.loadtxt(
+        fname=mut_file,
+        dtype=mut_dt, skiprows=1,
+        delimiter='\t',
+        usecols=(0,1,9,25,26,28,29)
+        )
+    return mut
+
+
+def _read_cnv(cnv_file):
+    """Gets copy number variation as an numpy array from an ICGC tsv.gz file.
+
+    Parameters
+    ----------
+    cnv_file : str
+        A file containing copy number variation data.
+
+    Returns
+    -------
+    cnv_data : array-like, shape (n_cnvs,)
+        A 1-D array with each entry corresponding to a single copy number
+        variation affecting a single sample.
+    """
+    cnv_data = np.loadtxt(
+        fname=cnv_file,
+        dtype=[('Sample',np.str_,64), ('Mean',np.float),
+               ('Chr',np.str_,64), ('Start',np.int), ('End',np.int)],
+        skiprows=1, delimiter='\t', usecols=(0,9,11,12,13)
+        )
+    return cnv_data
 
 
 class HetmanDataError(Exception):
@@ -703,6 +788,9 @@ class MutExpr(object):
         A list of mutation levels we want to consider, see
         MuTree and MutSet above.
 
+    load_cnv : bool, optional
+        Whether CNV data should loaded, the default is to omit it.
+
     Attributes
     ----------
     project_ : str
@@ -722,29 +810,25 @@ class MutExpr(object):
 
     test_mut_ : MuTree
         Hierarchy of mutations present in the testing samples.
+
+    cnv_ : dict
+        Mean CNV scores for genes whose mutations we want to consider.
     """
 
     def __init__(self,
                  project, mut_genes, cv_info=None,
-                 mut_levels = ('Gene', 'Conseq', 'Exon')):
+                 mut_levels = ('Gene', 'Conseq', 'Exon'), load_cnv=False):
 
         # loads gene expression and annotation data
         self.project_ = project
         annot = _read_annot()
-        expr = pd.read_table(
-                _data_dir + project + '/exp_seq.tsv.gz',
-                usecols=(0,7,8), header=0,
-                names=('Sample', 'Gene', 'FPKM'),
-                dtype={'Sample':'a64', 'Gene':'a64', 'FPKM':'f4'}
-                )
-        expr = expr.pivot_table(
-                index='Sample', columns='Gene',
-                values='FPKM', aggfunc=np.mean
-                )
+        expr = _read_expr(_data_dir + project + '/exp_seq.tsv.gz')
+        mut = _read_mut(_data_dir + project +
+                        '/simple_somatic_mutation.open.tsv.gz')
 
         # filters out genes that are not expressed in any samples, don't have
-        # any variation across the samples, or are not included in the
-        # annotation data
+        # any variation across the samples, are not included in the
+        # annotation data, or are not in the mutation dataset
         expr = expr.loc[:, expr.apply(
             lambda x: np.mean(x) > 0 and np.var(x) > 0,
             axis=0)]
@@ -752,25 +836,13 @@ class MutExpr(object):
                  if a['gene_name'] in expr.columns}
         annot_genes = [a['gene_name'] for g,a in annot.items()]
         expr = expr.loc[:, annot_genes]
-        annot_ids = {mut_g:g for g,a in annot.items() for mut_g in mut_genes
-                     if a['gene_name'] == mut_g}
-
-        # loads gene mutation data, gets set of samples for which such data is
-        # available
-        mut_dt = np.dtype(
-            [('Name', np.str_, 16), ('Sample', np.str_, 16),
-             ('Position', np.int), ('Consequence', np.str_, 46),
-             ('Protein', np.str_, 16), ('Gene', np.str_, 16),
-             ('Transcript', np.str_, 16)]
-            )
-        raw_mut = np.loadtxt(
-                    fname = _data_dir + project +
-                            '/simple_somatic_mutation.open.tsv.gz',
-                    dtype = mut_dt, skiprows = 1,
-                    delimiter = '\t',
-                    usecols = (0,1,9,25,26,28,29)
-                    )
-        samples = frozenset(set(raw_mut['Sample']) & set(expr.index))
+        annot_data = {mut_g:{'ID':g, 'Chr':a['chr'],
+                             'Start':a['Start'], 'End':a['End']}
+                      for g,a in annot.items() for mut_g in mut_genes
+                      if a['gene_name'] == mut_g}
+        annot_ids = {k:v['ID'] for k,v in annot_data.items()}
+        self.annot = annot
+        samples = frozenset(set(mut['Sample']) & set(expr.index))
 
         # if cross-validation info is specified, get list of samples used for
         # training and testing after filtering out those for which we don't
@@ -793,11 +865,11 @@ class MutExpr(object):
             self.train_expr_ = expr.loc[self.train_samps_, :]
             self.test_expr_ = expr.loc[samples - self.train_samps_, :]
             self.train_mut_ = MuTree(
-                muts=raw_mut, samples=self.train_samps_,
+                muts=mut, samples=self.train_samps_,
                 genes=annot_ids, levels=mut_levels
                 )
             self.test_mut_ = MuTree(
-                muts=raw_mut, samples=(samples - self.train_samps_),
+                muts=mut, samples=(samples - self.train_samps_),
                 genes=annot_ids, levels=mut_levels
                 )
             self.cv_index_ = cv_info['Sample'] ** 2
@@ -808,10 +880,30 @@ class MutExpr(object):
             self.train_samps_ = None
             self.train_expr_ = _norm_expr(expr.loc[samples, :])
             self.train_mut_ = MuTree(
-                muts=raw_mut, samples=samples,
+                muts=mut, samples=samples,
                 genes=annot_ids, levels=mut_levels
                 )
             self.cv_index_ = 0
+
+        # if applicable, get the samples' CNV scores for the genes whose
+        # mutations we want to consider
+        if load_cnv:
+            cnv_data = _read_cnv(
+                _data_dir + project +
+                '/copy_number_somatic_mutation.tsv.gz'
+                )
+            cnv_stats = {}
+            for g,an in annot_data.items():
+                gene_cnv = cnv_data[cnv_data['Chr'] == re.sub('chr','',
+                                                              an['Chr'])]
+                gene_cnv = gene_cnv[gene_cnv['Start'] <= an['Start']]
+                gene_cnv = gene_cnv[gene_cnv['End'] >= an['End']]
+                gene_cnv = np.sort(gene_cnv, order='Sample')
+                gene_cnv = {s:np.mean([y[1] for y in x]) for s,x in
+                            groupby(gene_cnv, lambda x: x['Sample'])}
+                cnv_stats[g] = {s:gene_cnv[s] if s in gene_cnv else 0
+                                for s in samples}
+            self.cnv_ = cnv_stats
 
     def training(self, mset=None):
         """Gets the expression data and the mutation status corresponding
@@ -871,6 +963,16 @@ class MutExpr(object):
         return (self.test_expr_,
                 self.test_mut_.status(self.test_expr_.index, mset))
 
+    def get_cnv(self, samples=None):
+        """Gets the CNV data for the given samples if it is available."""
+
+        if hasattr(self, 'cnv_'):
+            cnv = {g:{s:self.cnv_[g][s] for s in samples}
+                   for g in self.cnv_.keys()}
+        else:
+            cnv = None
+        return cnv
+
     def test_classif_cv(self,
                         classif, mset=None,
                         test_indx=range(20), tune_indx=None,
@@ -921,6 +1023,59 @@ class MutExpr(object):
                 estimator=classif, X=train_expr, y=train_mut,
                 scoring=_score_auc, cv=test_cvs, n_jobs=-1
             ), 25)
+
+    def test_classif_coef(self,
+                          classif, mset=None,
+                          test_indx=range(20), tune_indx=None,
+                          verbose=False):
+        """Test a classifier using tuning and cross-validation
+           within the training samples of this dataset.
+
+        Parameters
+        ----------
+        classif : MutClassifier
+            The classifier to test.
+
+        mset : MutSet, optional
+            The mutation sub-type to test the classifier on.
+            Default is to use all of the mutations available.
+
+        test_indx : list of ints, optional
+            Which of the internal cross-validation samples to use for testing
+            classifier performance.
+
+        tune_indx : list of ints, optional
+            Which of the internal cross-validation samples to use for tuning
+            the hyper-parameters of the given classifier.
+            Default is to not do any tuning and thus to use the default
+            hyper-parameter settings.
+
+        Returns
+        -------
+        P : float
+            The 1st quartile of tuned classifier performance across the
+            cross-validation samples. Used instead of the mean of performance
+            to take into account performance variation for "hard" samples.
+
+            Performance is measured using the area under the receiver operator
+            curve metric.
+        """
+        train_expr,train_mut,train_cv = self.training(mset)
+        test_cvs = [x for i,x in enumerate(train_cv)
+                    if i in test_indx]
+        if tune_indx is not None:
+            tune_cvs = [x for i,x in enumerate(train_cv)
+                        if i in tune_indx]
+            classif.tune(expr=train_expr, mut=train_mut,
+                         cv_samples=tune_cvs, test_count='auto',
+                         verbose=verbose)
+
+        perf = np.percentile(model_selection.cross_val_score(
+            estimator=classif, X=train_expr, y=train_mut,
+            scoring=_score_auc, cv=test_cvs, n_jobs=-1
+            ), 25)
+        coefs = classif.fit(X=train_expr, y=train_mut).get_coef()
+        return perf,coefs
 
     def test_classif_base(self, classif, tune_indx=range(5), mset=None):
         """Test a classifier using by tuning within the training samples,
