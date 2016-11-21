@@ -11,6 +11,7 @@ formats that facilitate classification of mutation sub-types.
 import numpy as np
 import pandas as pd
 import re
+import defunct
 
 from itertools import combinations as combn
 from itertools import groupby
@@ -98,11 +99,12 @@ def _read_expr(expr_file):
             names=('Sample', 'Gene', 'FPKM'),
             dtype={'Sample':'a64', 'Gene':'a64', 'FPKM':'f4'}
             )
-    expr = expr.pivot_table(
-            index='Sample', columns='Gene',
-            values='FPKM', aggfunc=np.mean
-            )
-    return expr
+    
+    # transforms raw long-format expression data into wide-format
+    return expr.pivot_table(
+        index='Sample', columns='Gene',
+        values='FPKM', aggfunc=np.mean
+        )
 
 
 def _read_mut(mut_file):
@@ -125,13 +127,12 @@ def _read_mut(mut_file):
          ('Protein', np.str_, 16), ('Gene', np.str_, 16),
          ('Transcript', np.str_, 16)]
         )
-    mut = np.loadtxt(
+    return np.loadtxt(
         fname=mut_file,
         dtype=mut_dt, skiprows=1,
         delimiter='\t',
         usecols=(0,1,9,25,26,28,29)
         )
-    return mut
 
 
 def _read_cnv(cnv_file):
@@ -148,13 +149,12 @@ def _read_cnv(cnv_file):
         A 1-D array with each entry corresponding to a single copy number
         variation affecting a single sample.
     """
-    cnv_data = np.loadtxt(
+    return np.loadtxt(
         fname=cnv_file,
         dtype=[('Sample',np.str_,64), ('Mean',np.float),
                ('Chr',np.str_,64), ('Start',np.int), ('End',np.int)],
         skiprows=1, delimiter='\t', usecols=(0,9,11,12,13)
         )
-    return cnv_data
 
 
 class HetmanDataError(Exception):
@@ -207,9 +207,6 @@ class MuTree(object):
     level_ : str
         The mutation level at the head of this mutation tree.
 
-    leaf_ : bool
-        Whether or not this is a leaf node, i.e. does this tree have individual
-        samples instead of other trees as children.
     """
 
     def __init__(self,
@@ -220,7 +217,6 @@ class MuTree(object):
         else:
             self.levels_ = levels
         self.level_ = self.levels_[1][0]
-        self.leaf_ = len(self.levels_[1]) == 1
 
         # handles the possible mutation hierarchy levels
         null_arr = np.empty(shape=0, dtype=muts.dtype)
@@ -260,6 +256,16 @@ class MuTree(object):
                 for nm in set(mut_s['Name']):
                     nm_mut = mut_s[mut_s['Name'] == nm]
                     nm_mut.sort(order='Transcript')
+
+                    # fixes ICGC bug where transcript-level entries are
+                    # sometimes duplicated
+                    trx_len = len(nm_mut['Transcript'])
+                    trx_count = len(set(nm_mut['Transcript']))
+                    if (trx_len > trx_count and (trx_len % trx_count) == 0
+                        and all([len(set([x['Protein'] for x in v])) == 1 for k,v
+                                 in groupby(nm_mut, lambda x: x['Transcript'])])):
+                        nm_mut = nm_mut[:trx_count]
+
                     exons = reduce(
                         lambda x,y: x+y,
                         ['o' if x else 'x'
@@ -274,7 +280,7 @@ class MuTree(object):
 
         # unless we have reached the final level, recurse down
         # to the next level
-        if not self.leaf_:
+        if len(self.levels_[1]) > 1:
             self.child = {g:MuTree(
                 muts=new_muts[g],
                 samples=(samples & set(new_samps[g])), genes=genes,
@@ -291,7 +297,7 @@ class MuTree(object):
         new_str = self.level_
         for k,v in self.child.items():
             new_str = new_str + ' IS ' + k
-            if not self.leaf_:
+            if isinstance(v, MuTree):
                 new_str = (new_str + ' AND '
                            + '\n' + '\t'*(len(self.levels_[0])+1) + str(v))
             else:
@@ -330,11 +336,36 @@ class MuTree(object):
         for k,v in self.child.items():
             for l,w in mset.child.items():
                 if k in l:
-                    if not self.leaf_:
+                    if isinstance(v, MuTree):
                         samps |= v.get_samples(w)
                     else:
                         samps |= v
         return samps
+
+    def add_cnvs(self, mut_gene, cnvs):
+        """Adds a list of copy number variations for the given gene to the
+           mutation hierarchy. CNVs are treated as Gain/Loss entries on the
+           Consequence level.
+
+        Parameters
+        ----------
+        mut_gene : str
+            One of the genes in the mutation tree. An error will be raised
+            otherwise.
+
+        cnvs : dict
+            A dictionary with "Gain" and/or "Loss" as keys and individual
+            samples as values.
+        """
+        if self.level_ != 'Gene':
+            raise HetmanDataError("CNVs can only be added to the "
+                                  "<Gene> level of a mutation tree.")
+        if not mut_gene in self.child.keys():
+            raise HetmanDataError("CNVs can only be added to a gene "
+                                  "already in the tree.")
+        for k,v in cnvs.items():
+            if v:
+                self.child[mut_gene].child['Loss'] = frozenset(v)
 
     def allkey(self, levels=None):
         """Gets the key corresponding to the MutSet that contains all of the
@@ -357,13 +388,11 @@ class MuTree(object):
         """
         if levels is None:
             levels = self.levels_[1]
-        if not self.leaf_ and self.level_ != levels[-1]:
-            new_key = {(self.level_, k):v.allkey(levels)
-                       for k,v in self.child.items()}
-        else:
-            new_key = {(self.level_, k):None
-                       for k in self.child.keys()}
-        return new_key
+        return {(self.level_, k):(v.allkey(levels) 
+                                  if (isinstance(v, Mutree)
+                                      and self.level_ != levels[-1])
+                                  else None)
+                for k,v in self.child.items()}
 
     def subsets(self, mset=None, levels=None):
         """Gets all of the MutSets corresponding to exactly one of the
@@ -389,12 +418,18 @@ class MuTree(object):
         if levels is None:
             levels = self.levels_[1]
         msets = []
-        if not self.leaf_ and self.level_ != levels[-1]:
+        if self.level_ != levels[-1]:
             for k,v in self.child.items():
                 for l,w in mset.child.items():
                     if k in l:
-                        msets += [MutSet({(self.level_, k):s})
-                                  for s in v.subsets(w, levels)]
+                        if isinstance(v, MuTree):
+                            msets += [MutSet({(self.level_, k):s})
+                                      for s in v.subsets(w, levels)]
+                        else:
+                            msets += [MutSet({(self.level_, k):None})
+                                      for k in (set(self.child.keys())
+                                                & reduce(lambda x,y: x|y,
+                                                         mset.child.keys()))]
         else:
             msets += [MutSet({(self.level_, k):None})
                       for k in (set(self.child.keys())
@@ -417,7 +452,7 @@ class MuTree(object):
             A list of MutSets.
         """
         msets = []
-        if not self.leaf_:
+        if not len(self.levels_[1]) > 1:
             for k,v in self.child.items():
                 for l,w in mset.child.items():
                     if k in l:
@@ -904,6 +939,15 @@ class MutExpr(object):
                 cnv_stats[g] = {s:gene_cnv[s] if s in gene_cnv else 0
                                 for s in samples}
             self.cnv_ = cnv_stats
+
+    def add_cnv_loss(self):
+        """Adds CNV loss inferred using a Gaussian mixture model
+           to the mutation tree.
+        """
+        cnv_def = defunct.Defunct(self)
+        loss_samps = cnv_def.get_loss()
+        self.train_mut_.add_cnvs(cnv_def.mut_gene_, {'Loss': loss_samps[0]})
+        self.test_mut_.add_cnvs(cnv_def.mut_gene_, {'Loss': loss_samps[1]})
 
     def training(self, mset=None):
         """Gets the expression data and the mutation status corresponding
