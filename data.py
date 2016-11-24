@@ -389,7 +389,7 @@ class MuTree(object):
         if levels is None:
             levels = self.levels_[1]
         return {(self.level_, k):(v.allkey(levels) 
-                                  if (isinstance(v, Mutree)
+                                  if (isinstance(v, MuTree)
                                       and self.level_ != levels[-1])
                                   else None)
                 for k,v in self.child.items()}
@@ -1018,7 +1018,7 @@ class MutExpr(object):
         return cnv
 
     def test_classif_cv(self,
-                        classif, mset=None,
+                        classif, mset=None, gene_list=None,
                         test_indx=range(20), tune_indx=None,
                         verbose=False):
         """Test a classifier using tuning and cross-validation
@@ -1053,7 +1053,7 @@ class MutExpr(object):
             Performance is measured using the area under the receiver operator
             curve metric.
         """
-        train_expr,train_mut,train_cv = self.training(mset)
+        train_expr,train_mut,train_cv = self.training(mset, gene_list)
         test_cvs = [x for i,x in enumerate(train_cv)
                     if i in test_indx]
         if tune_indx is not None:

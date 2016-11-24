@@ -9,7 +9,7 @@ Classification of mutation sub-types using expression data.
 import itertools
 import numpy as np
 from sklearn.mixture import GaussianMixture
-from sklearn.preprocessing import scale
+from sklearn.preprocessing import StandardScaler
 from scipy import linalg
 import matplotlib.pyplot as plt
 import matplotlib as mpl
@@ -34,25 +34,27 @@ class Defunct(object):
                           mut_expr.test_expr_.index]
         self.train_samps = mut_expr.train_expr_.index
         self.test_samps = mut_expr.test_expr_.index
-        self.train_expr_ = scale(mut_expr.train_expr_.loc[:,mut_gene])
-        self.test_expr_ = scale(mut_expr.test_expr_.loc[:,mut_gene])
+        self.train_expr_ = mut_expr.train_expr_.loc[:,mut_gene]
+        self.test_expr_ = mut_expr.test_expr_.loc[:,mut_gene]
 
     def infer_cnv(self):
+        norm = StandardScaler()
         mix = GaussianMixture(
             n_components=3, covariance_type='full', n_init=20,
             init_params='random', weights_init=[0.1,0.8,0.1],
             means_init=[(-1,-1), (0,0), (1,1)]
             )
         train_data = np.column_stack((self.train_expr_, self.train_cnv_))
+        train_data = norm.fit_transform(train_data)
         mix.fit(train_data)
         train_labels = mix.predict(train_data)
         train_probs = mix.predict_proba(train_data)
-        return mix,train_data,train_labels,train_probs
+        return norm,mix,train_data,train_labels,train_probs
 
     def get_loss(self):
-        mix,train_data,train_labels,train_probs = self.infer_cnv()
-        test_labels = mix.predict(
-            np.column_stack((self.test_expr_, self.test_cnv_)))
+        norm,mix,train_data,train_labels,train_probs = self.infer_cnv()
+        test_labels = mix.predict(norm.transform(
+            np.column_stack((self.test_expr_, self.test_cnv_))))
         return (tuple(self.train_samps[train_labels == 0]),
                 tuple(self.test_samps[test_labels == 0]))
 

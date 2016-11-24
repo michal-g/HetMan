@@ -242,5 +242,9 @@ class KBTL(object):
         return pred
 
     def get_params(self):
-        pass
+        return {'sigma_h':self.sigma_h}
+
+    def set_params(self, **kwargs):
+        for k,v in kwargs.iteritems():
+            setattr(self, k, v)
 
