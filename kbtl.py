@@ -11,30 +11,76 @@ import numpy as np
 from random import gauss as rnorm
 from sklearn import metrics
 from scipy.stats import norm
+from math import log
+
+
+# .. helper functions for use in variational approximation ..
+def _bhatta_dist(dist1, dist2):
+    """Calculates Bhattacharyya distance between two normal distributions.
+       See https://en.wikipedia.org/wiki/Bhattacharyya_distance for details.
+
+    Parameters
+    ----------
+    dist1, dist2 : dicts
+        A pair of normal distributions each characterized by a dictionary
+        with 'mu' and 'sigma' fields.
+
+    Returns
+    -------
+    D : The distance between the two distributions.
+    """
+    return (0.25 * log(0.25 * ((dist1['sigma'] / dist2['sigma'])
+                               + (dist2['sigma'] / dist1['sigma'])
+                               + 2.0))
+            + 0.25 * (((dist1['mu'] - dist2['mu']) ** 2.0)
+                      / (dist1['sigma'] + dist2['sigma']))
+           )
 
 
 class KBTL(object):
-    """Kernel based transfer learning classifier.
+    """Kernel based transfer learning classifier adapted for use in HetMan
+       optimizers. 
+
+    Parameters
+    ----------
+    kernel : str, default 'rbf'
+        Which function to use for kernel-based dimensionality reduction.
+        Default is to use the Gaussian kernel with width equal to the mean
+        of pairwise distances between the training data points, calculated
+        separately for each domain.
+
+    R : int, default 20
+        How many features to use in the shared classification subspace.
+        Must be a positive integer.
+
+
     """
 
     def __init__(self,
                  kernel='rbf', R=20, sigma_h=0.1,
                  lambda_par={'a':1.0,'b':1.0}, gamma_par={'a':1.0,'b':1.0},
                  eta_par={'a':1.0,'b':1.0}, margin=1.0,
-                 max_iter=50, stopping_tol=1e-3):
+                 max_iter=50, stopping_tol=1e-4):
         self.R = R
+        self.kernel = kernel
         self.sigma_h = sigma_h
         self.lambda_par = lambda_par
         self.gamma_par = gamma_par
         self.eta_par = eta_par
         self.margin = margin
         self.max_iter = max_iter
+        self.stopping_tol = stopping_tol
 
     def fit(self, X_list, y_list, verbose=False):
         # calculates kernel matrices
         data_count = [x.shape[0] for x in X_list]
-        kernel_list = [metrics.pairwise.rbf_kernel(x,gamma=10**-5)
+        if self.kernel == 'rbf':
+            X_gamma = [np.mean(metrics.pairwise.pairwise_distances(x))
                        for x in X_list]
+            kernel_list = [metrics.pairwise.rbf_kernel(x,gamma=gam**-2.0)
+                           for x,gam in zip(X_list, X_gamma)]
+        elif self.kernel == 'linear':
+            pass
         y_list = [[1.0 if x else -1.0 for x in y] for y in y_list]
 
         # initializes matrix of priors for task-specific projection matrices
@@ -88,7 +134,8 @@ class KBTL(object):
         # does inference using variational Bayes for the given number
         # of iterations
         cur_iter = 1
-        while(cur_iter <= self.max_iter):
+        f_dist = 1e10
+        while(cur_iter <= self.max_iter and f_dist > self.stopping_tol):
             if verbose and (cur_iter % 10) == 0:
                 print "On iteration " + str(cur_iter) + "...."
                 print "gamma_beta: " + str(round(gamma_beta, 4))
@@ -183,6 +230,7 @@ class KBTL(object):
             bw_mu = np.dot(bw_sigma, bw_mu.transpose())
 
             # updates posterior distributions of predicted outputs
+            f_dist = 0
             for i in xrange(len(X_list)):
                 f_out = np.dot(
                     np.vstack(([1 for r in xrange(data_count[i])],
@@ -194,6 +242,8 @@ class KBTL(object):
                 norm_factor = [norm.cdf(b) - norm.cdf(a) if a != b
                                else 1
                                for a,b in zip(alpha_norm, beta_norm)]
+                old_fpost = {'mu':f_list[i]['mu'],
+                             'sigma':f_list[i]['sigma']}
                 f_list[i]['mu'] = [
                     f + ((norm.pdf(a) - norm.pdf(b)) / n)
                     for a,b,n,f in
@@ -205,6 +255,15 @@ class KBTL(object):
                     - ((norm.pdf(a) - norm.pdf(b)) ** 2) / n**2
                     for a,b,n in zip(alpha_norm, beta_norm, norm_factor)
                     ]
+                f_dist += np.mean(
+                    [_bhatta_dist(d1, d2)
+                     for d2,d1 in zip(
+                         [{'mu':mu2, 'sigma':sigma2} for mu2,sigma2
+                          in zip(f_list[i]['mu'], f_list[i]['sigma'])],
+                         [{'mu':mu1, 'sigma':sigma1} for mu1,sigma1
+                          in zip(old_fpost['mu'], old_fpost['sigma'])]
+                        )
+                    ]) / float(len(X_list))
 
             bw_mu = bw_mu.transpose().tolist()[0]
             cur_iter += 1
@@ -219,8 +278,13 @@ class KBTL(object):
 
     def predict_proba(self, X_list):
         data_count = [x.shape[0] for x in X_list]
-        kernel_list = [metrics.pairwise.rbf_kernel(x,y,gamma=10**-5)
-                       for x,y in zip(self.X, X_list)]
+        if self.kernel == 'rbf':
+            X_gamma = [np.mean(metrics.pairwise.pairwise_distances(x))
+                       for x in X_list]
+            kernel_list = [metrics.pairwise.rbf_kernel(x,y,gamma=gam**-2.0)
+                           for x,y,gam in zip(self.X, X_list, X_gamma)]
+        elif self.kernel == 'linear':
+            pass
 
         h_mu = [np.dot(a['mu'].transpose(), k)
                 for a,k in zip(self.A, kernel_list)]
@@ -240,6 +304,12 @@ class KBTL(object):
                   for mu,sigma in zip(f_mu,f_sigma)]
         pred = [(p/(p+n))[0].tolist() for p,n in pred_p]
         return pred
+
+    def score(self, X_list, y_list):
+        pred_y = self.predict_proba(X_list)
+        auc_scores = [metrics.roc_auc_score(x,y)
+                      for x,y in zip(y_list, pred_y)]
+        return np.mean(auc_scores)
 
     def get_params(self):
         return {'sigma_h':self.sigma_h}

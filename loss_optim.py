@@ -10,6 +10,7 @@ from math import exp, log
 from itertools import product
 import dill
 from pathos.multiprocessing import ProcessingPool
+import data
 
 
 class LossOptimError(Exception):
@@ -32,46 +33,89 @@ class LossOptimizer(object):
                                  "the same mutated gene.")
         else:
             mut_gene = list(mut_gene)[0]
+        self.mut_gene = mut_gene
         
         mut_chr = [v['chr'] for k,v in cdata_list[0].annot.items()
                    if v['gene_name'] == mut_gene][0]
         self.use_genes = [[v['gene_name'] for v in x.annot.values()
                            if v['chr'] != mut_chr]
                           for x in cdata_list]
+        self.all_genes = [[v['gene_name'] for v in x.annot.values()]
+                          for x in cdata_list]
 
         for i in xrange(len(cdata_list)):
             cdata_list[i].add_cnv_loss()
         self.data = cdata_list
-        #self.uniclx = [hclassif.Lasso([mut_gene], x) for x in self.use_genes]
+        self.uniclx = [hclassif.Lasso([mut_gene], x)
+                       for x in self.all_genes]
         self.multiclx = MultiKBTL(self.use_genes)
-        self.history = []
+        self.history = {}
 
     def __str__(self):
         pass
 
+    def test_uniclx(self,
+                    mset, test_indx=range(16), tune_indx=(50,75),
+                    gene_lists=None, verbose=True):
+        if gene_lists is None:
+            gene_lists = self.all_genes
+        clx_perf = [
+            d.test_classif_cv(
+                classif=c, mset=mset,
+                test_indx=test_indx, tune_indx=tune_indx,
+                gene_list=g, final_fit=True, verbose=verbose)
+            for d,c,g in zip(self.data, self.uniclx, gene_lists)]
+        clx_coef = [{g:c for g,c in zip(gn,cf) if c>0}
+                    for gn,cf in zip(
+                        gene_lists, [clx.named_steps['fit'].coef_[0]
+                                     for clx in self.uniclx])]
+        return clx_perf,clx_coef
+
     def test_multiclx(self,
                       mset, test_indx=range(16), tune_indx=(50,75),
-                      verbose=True):
+                      gene_lists=None, verbose=True):
+        if gene_lists is None:
+            gene_lists = self.all_genes
         train_list = [x.training(mset=mset) for x in self.data]
-        test_cvs = [[x for i,x in enumerate(tr_l[2])
-                     if i in test_indx] for tr_l in train_list]
+        test_cvs = [[tr_l[2][i] for tr_l in train_list] for i in test_indx]
         if tune_indx is not None:
             tune_cvs = [[x for i,x in enumerate(tr_l[2])
                         if i in tune_indx] for tr_l in train_list]
             self.multiclx.tune(
-                expr_list=[x[0] for x in train_list],
+                expr_list=[x[0].loc[:,g]
+                           for g,x in zip(gene_lists,train_list)],
                 mut_list=[x[1] for x in train_list],
                 cv_samples=tune_cvs, verbose=verbose
                 )
-
-        return np.percentile(model_selection.cross_val_score(
-            estimator=self.multiclx,
-            X=[x[0] for x in train_list], y=[x[1] for x in train_list],
-            scoring=_score_auc, cv=test_cvs, n_jobs=-1
-            ), 25)
+        return self.multiclx.crossval_score(
+            expr_list=[x[0].loc[:,g]
+                       for g,x in zip(gene_lists,train_list)],
+            mut_list=[x[1] for x in train_list],
+            cv_list = test_cvs
+            )
 
     def step(self):
-        pass
+        if not self.history:
+            print ("Initializing Loss Optimizer for gene "
+                   + self.mut_gene + " in ICGC projects "
+                   + reduce(lambda x,y: x + ", " + y,
+                            [d.project_ for d in self.data]))
+            mset_cur = data.MutSet(
+                {('Gene','TP53'):{('Conseq','Loss'):None}})
+            self.history['Uni'] = {'Perf':{'All':{},'Use':{}},
+                                   'Coef':{'All':{},'Use':{}}}
+            self.history['Multi'] = {}
+            all_perf,all_coef = self.test_uniclx(
+                mset=mset_cur, gene_lists=self.all_genes)
+            use_perf,use_coef = self.test_uniclx(
+                mset=mset_cur, gene_lists=self.use_genes)
+            self.history['Uni']['Perf']['All'][mset_cur] = all_perf
+            self.history['Uni']['Perf']['Use'][mset_cur] = use_perf
+            self.history['Uni']['Coef']['All'][mset_cur] = all_coef
+            self.history['Uni']['Coef']['Use'][mset_cur] = use_coef
+
+        elif not self.history['Multi']:
+            pass
 
 
 class MultiKBTL(object):
@@ -84,7 +128,7 @@ class MultiKBTL(object):
         self._param_priors = {'sigma_h':stats.lognorm(scale=exp(-2), s=1)}
         self.scalers = [preprocessing.StandardScaler()
                         for i in xrange(len(expr_genes))]
-        self.fitter = KBTL(sigma_h=self._tune_params['sigma_h'], max_iter=25)
+        self.fitter = KBTL(sigma_h=self._tune_params['sigma_h'])
 
     def __str__(self):
         print self._tune_params
@@ -94,13 +138,15 @@ class MultiKBTL(object):
                     for param,distr in self._param_priors.items()}
         grid_test = self.grid_search(
             expr_list, mut_list, new_grid, cv_samples)
+        best_perf = max(grid_test.values())
         for param in self._tune_params.keys():
             new_mean,new_sd = self._update_params(
                 [(dict(x)[param],y) for x,y in grid_test.items()])
             self._param_priors[param] = stats.lognorm(
                 scale=new_mean, s=new_sd)
-        if verbose:
-            print self
+            self._tune_params[param] = [dict(k)[param]
+                                        for k,v in grid_test.items()
+                                        if v == best_perf][0]
 
     def grid_search(self, expr_list, mut_list, new_grid, cv_samples):
         param_tbl = [{k:v for k,v in zip(new_grid.keys(), params)}
@@ -126,19 +172,35 @@ class MultiKBTL(object):
             out_list += [self.score(test_expr, test_mut)]
         return np.mean(out_list)
 
-    def fit(self, expr_list, mut_list, params=None, verbose=True):
+    def fit(self, expr_list, mut_list, verbose=True):
         norm_expr = [[] for i in xrange(len(expr_list))]
         for i in xrange(len(expr_list)):
             norm_expr[i] = self.scalers[i].fit_transform(
                 expr_list[i].loc[:,self._expr_genes[i]])
-        if params is not None:
-            self.fitter.set_params(**params)
+        self.fitter.set_params(**self._tune_params)
         self.fitter.fit(norm_expr, mut_list, verbose=verbose)
 
     def predict(self, expr_list):
         new_expr = [sc.transform(x.loc[:,g]) for x,g,sc
                     in zip(expr_list, self._expr_genes, self.scalers)]
         return self.fitter.predict_proba(new_expr)
+
+    def score(self, expr_list, mut_list):
+        mut_pred = self.predict(expr_list)
+        auc_scores = [roc_auc_score(x,y) for x,y in zip(mut_list, mut_pred)]
+        return np.mean(auc_scores)
+
+    def score_cv(self, expr_list, mut_list, cv_pairs):
+        train_expr = [expr.ix[cv[0],:]
+                      for expr,cv in zip(expr_list, cv_pairs)]
+        test_expr = [expr.ix[cv[1],:]
+                     for expr,cv in zip(expr_list, cv_pairs)]
+        train_mut = [np.array(mut)[cv[0]]
+                     for mut,cv in zip(mut_list, cv_pairs)]
+        test_mut = [np.array(mut)[cv[1]]
+                    for mut,cv in zip(mut_list, cv_pairs)]
+        self.fit(train_expr, train_mut)
+        return self.score(test_expr, test_mut)
 
     def transform(self, expr_list):
         trans_X = [[] for i in xrange(len(expr_list))]
@@ -155,30 +217,11 @@ class MultiKBTL(object):
         self.fitter.fit(trans_X, mut_list)
         return trans_X
 
-    def score(self, expr_list, mut_list):
-        """Computes the AUC score for a mutation classifier on a given
-           expression matrix and a mutation state vector.
-        
-        Parameters
-        ----------
-        estimator : UniClassifier
-            A mutation classification algorithm as defined below.
-
-        expr : array-like, shape (n_samples,n_features)
-            An expression dataset.
-            
-        mut : array-like, shape (n_samples,)
-            A boolean vector corresponding to the presence of a particular type of
-            mutation in the same set of samples as the given expression dataset.
-
-        Returns
-        -------
-        S : float
-            The AUC score corresponding to mutation classification accuracy.
-        """
-        mut_scores = self.predict(expr_list)
-        return np.mean([roc_auc_score(m,s) 
-                        for m,s in zip(mut_list, mut_scores)])
+    def crossval_score(self, expr_list, mut_list, cv_list):
+        pool = ProcessingPool(nodes=16)
+        cv_scores = pool.map(lambda cv: self.score_cv(
+            expr_list, mut_list, cv), cv_list)
+        return np.mean(cv_scores)
     
     def _update_params(self, param_list):
         """Returns an updated list of hyper-parameters for the log-normal

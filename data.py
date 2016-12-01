@@ -949,7 +949,7 @@ class MutExpr(object):
         self.train_mut_.add_cnvs(cnv_def.mut_gene_, {'Loss': loss_samps[0]})
         self.test_mut_.add_cnvs(cnv_def.mut_gene_, {'Loss': loss_samps[1]})
 
-    def training(self, mset=None):
+    def training(self, mset=None, gene_list=None):
         """Gets the expression data and the mutation status corresponding
            to a given mutation sub-type for the training samples in this
            dataset.
@@ -973,8 +973,10 @@ class MutExpr(object):
             A list of internal cross-validation splits to be used for
             classifier tuning, model selection, etc.
         """
+        if gene_list is None:
+            gene_list = self.train_expr_.columns
         mut_status = self.train_mut_.status(self.train_expr_.index, mset)
-        return (self.train_expr_,
+        return (self.train_expr_.loc[:,gene_list],
                 mut_status,
                 [(x,y) for x,y
                  in model_selection.StratifiedShuffleSplit(
@@ -1020,13 +1022,13 @@ class MutExpr(object):
     def test_classif_cv(self,
                         classif, mset=None, gene_list=None,
                         test_indx=range(20), tune_indx=None,
-                        verbose=False):
+                        final_fit=False, verbose=False):
         """Test a classifier using tuning and cross-validation
            within the training samples of this dataset.
 
         Parameters
         ----------
-        classif : MutClassifier
+        classif : UniClassifier
             The classifier to test.
 
         mset : MutSet, optional
@@ -1040,8 +1042,18 @@ class MutExpr(object):
         tune_indx : list of ints, optional
             Which of the internal cross-validation samples to use for tuning
             the hyper-parameters of the given classifier.
-            Default is to not do any tuning and thus to use the default
+            Default is to not do any tuning and thus use the default
             hyper-parameter settings.
+
+        final_fit : boolean
+            Whether or not to fit the given classifier to all of the training
+            data after tuning and testing is complete. Useful if, for
+            instance, we want to learn about the coefficients of this
+            classifier when predicting the given set of mutations.
+
+        verbose : boolean
+            Whether or not the classifier should print information about the
+            optimal hyper-parameters found during tuning.
 
         Returns
         -------
@@ -1063,65 +1075,15 @@ class MutExpr(object):
                          cv_samples=tune_cvs, test_count='auto',
                          verbose=verbose)
 
-        return np.percentile(model_selection.cross_val_score(
-                estimator=classif, X=train_expr, y=train_mut,
-                scoring=_score_auc, cv=test_cvs, n_jobs=-1
-            ), 25)
-
-    def test_classif_coef(self,
-                          classif, mset=None,
-                          test_indx=range(20), tune_indx=None,
-                          verbose=False):
-        """Test a classifier using tuning and cross-validation
-           within the training samples of this dataset.
-
-        Parameters
-        ----------
-        classif : MutClassifier
-            The classifier to test.
-
-        mset : MutSet, optional
-            The mutation sub-type to test the classifier on.
-            Default is to use all of the mutations available.
-
-        test_indx : list of ints, optional
-            Which of the internal cross-validation samples to use for testing
-            classifier performance.
-
-        tune_indx : list of ints, optional
-            Which of the internal cross-validation samples to use for tuning
-            the hyper-parameters of the given classifier.
-            Default is to not do any tuning and thus to use the default
-            hyper-parameter settings.
-
-        Returns
-        -------
-        P : float
-            The 1st quartile of tuned classifier performance across the
-            cross-validation samples. Used instead of the mean of performance
-            to take into account performance variation for "hard" samples.
-
-            Performance is measured using the area under the receiver operator
-            curve metric.
-        """
-        train_expr,train_mut,train_cv = self.training(mset)
-        test_cvs = [x for i,x in enumerate(train_cv)
-                    if i in test_indx]
-        if tune_indx is not None:
-            tune_cvs = [x for i,x in enumerate(train_cv)
-                        if i in tune_indx]
-            classif.tune(expr=train_expr, mut=train_mut,
-                         cv_samples=tune_cvs, test_count='auto',
-                         verbose=verbose)
-
         perf = np.percentile(model_selection.cross_val_score(
             estimator=classif, X=train_expr, y=train_mut,
             scoring=_score_auc, cv=test_cvs, n_jobs=-1
             ), 25)
-        coefs = classif.fit(X=train_expr, y=train_mut).get_coef()
-        return perf,coefs
+        if final_fit:
+            classif.fit(X=train_expr, y=train_mut)
+        return perf
 
-    def test_classif_base(self, classif, tune_indx=range(5), mset=None):
+    def test_classif_full(self, classif, tune_indx=range(5), mset=None):
         """Test a classifier using by tuning within the training samples,
            training on all of them, and then testing on the testing samples.
 
