@@ -60,7 +60,7 @@ class KBTL(object):
                  kernel='rbf', R=20, sigma_h=0.1,
                  lambda_par={'a':1.0,'b':1.0}, gamma_par={'a':1.0,'b':1.0},
                  eta_par={'a':1.0,'b':1.0}, margin=1.0,
-                 max_iter=50, stopping_tol=1e-4):
+                 max_iter=50, stopping_tol=1e-3):
         self.R = R
         self.kernel = kernel
         self.sigma_h = sigma_h

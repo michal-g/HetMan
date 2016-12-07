@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 import re
 import defunct
+import operator
 
 from itertools import combinations as combn
 from itertools import groupby
@@ -452,7 +453,7 @@ class MuTree(object):
             A list of MutSets.
         """
         msets = []
-        if not len(self.levels_[1]) > 1:
+        if len(self.levels_[1]) > 1:
             for k,v in self.child.items():
                 for l,w in mset.child.items():
                     if k in l:
@@ -676,6 +677,8 @@ class MutSet(object):
     def __eq__(self, other):
         """Two MutSets are equal if and only if they have the same set
            of children MutSets for the same subsets."""
+        if isinstance(self, MutSet) ^ isinstance(other, MutSet):
+            return False
         if self.level_ != other.level_:
             raise HetmanDataError("can't compare MutSets"
                                   "of different levels")
@@ -729,31 +732,44 @@ class MutSet(object):
             raise HetmanDataError('mismatching MutSet levels')
         self_keys = reduce(lambda x,y: x|y, self.child.keys())
         other_keys = reduce(lambda x,y: x|y, other.child.keys())
-        if self_keys >= other_keys:
-            for k,v in other.child.items():
-                for l,w in self.child.items():
-                    if k > l or v is None:
-                        return False
-                    elif not w >= v:
-                        return False
-            return True
+        self_refact = {x:reduce(lambda x,y: x|y,
+                                [v for k,v in self.child.items() if x in k])
+                       for x in self_keys}
+        other_refact = {x:reduce(lambda x,y: x|y,
+                                 [v for k,v in other.child.items() if x in k])
+                        for x in other_keys}
+        if set(self_keys) >= set(other_keys):
+            return all([True if self_refact[k] is None
+                        else False if other_refact[k] is None
+                        else self_refact[k] >= other_refact[k]
+                       for k in list(set(self_refact) & set(other_refact))])
         else:
             return False
 
     def __gt__(self, other):
         """Checks if one MutSet is a proper subset of the other."""
         if self.level_ != other.level_:
-            raise HetmanError('mismatching MutSet levels')
+            raise HetmanDataError('mismatching MutSet levels')
         self_keys = reduce(lambda x,y: x|y, self.child.keys())
         other_keys = reduce(lambda x,y: x|y, other.child.keys())
-        if self_keys >= other_keys:
-            for k,v in other.child.items():
-                for l,w in self.child.items():
-                    if k >= l or v is None:
-                        return False
-                    elif not w > v:
-                        return False
-            return True
+        self_refact = {x:reduce(lambda x,y: x|y,
+                                [v for k,v in self.child.items() if x in k])
+                       for x in self_keys}
+        other_refact = {x:reduce(lambda x,y: x|y,
+                                 [v for k,v in other.child.items() if x in k])
+                        for x in other_keys}
+        if set(self_keys) == set(other_keys):
+            comp_keys = list(set(self_refact) & set(other_refact))
+            gt_comp = [True if self_refact[k] is None
+                       else False if other_refact[k] is None
+                       else self_refact[k] >= other_refact[k]
+                       for k in comp_keys]
+            eq_comp = [self_refact[k] == other_refact[k] for k in comp_keys]
+            return all(gt_comp) and not all(eq_comp)
+        elif set(self_keys) > set(other_keys):
+            comp_keys = list(set(self_refact) & set(other_refact))
+            return all([self_refact[k] >= other_refact[k]
+                    for k in comp_keys])
         else:
             return False
 
@@ -764,10 +780,10 @@ class MutSet(object):
         self_set = set(self.child.keys()) - set(other.child.keys())
         both_set = set(self.child.keys()) & set(other.child.keys())
         new_key = {}
-        if len(self_set) > 0:
+        if self_set:
             new_key.update({(self.level_, k):self.child[k]
                             for k in self_set})
-        if len(both_set) > 0:
+        if both_set:
             new_key.update(dict(tuple((
                 tuple((self.level_, k)), self.child[k] - other.child[k]))
                 for k in both_set if self.child[k] != other.child[k]))
@@ -944,10 +960,13 @@ class MutExpr(object):
         """Adds CNV loss inferred using a Gaussian mixture model
            to the mutation tree.
         """
-        cnv_def = defunct.Defunct(self)
-        loss_samps = cnv_def.get_loss()
-        self.train_mut_.add_cnvs(cnv_def.mut_gene_, {'Loss': loss_samps[0]})
-        self.test_mut_.add_cnvs(cnv_def.mut_gene_, {'Loss': loss_samps[1]})
+        for gene in self.cnv_.keys():
+            cnv_def = defunct.Defunct(self, gene)
+            loss_samps = cnv_def.get_loss()
+            self.train_mut_.add_cnvs(cnv_def.mut_gene_,
+                                     {'Loss': loss_samps[0]})
+            self.test_mut_.add_cnvs(cnv_def.mut_gene_,
+                                    {'Loss': loss_samps[1]})
 
     def training(self, mset=None, gene_list=None):
         """Gets the expression data and the mutation status corresponding
@@ -984,7 +1003,7 @@ class MutExpr(object):
                      random_state=self.cv_index_
                  ).split(self.train_expr_, mut_status)])
 
-    def testing(self, mset=None):
+    def testing(self, mset=None, gene_list=None):
         """Gets the expression data and the mutation status corresponding
            to a given mutation sub-type for the testing samples in this
            dataset.
@@ -1006,8 +1025,11 @@ class MutExpr(object):
         """
         if self.train_samps_ is None:
             raise HetmanError("No testing set defined!")
-        return (self.test_expr_,
-                self.test_mut_.status(self.test_expr_.index, mset))
+        if gene_list is None:
+            gene_list = self.test_expr_.columns
+        mut_status = self.test_mut_.status(self.test_expr_.index, mset)
+        return (self.test_expr_.loc[:,gene_list],
+                mut_status)
 
     def get_cnv(self, samples=None):
         """Gets the CNV data for the given samples if it is available."""
@@ -1020,7 +1042,8 @@ class MutExpr(object):
         return cnv
 
     def test_classif_cv(self,
-                        classif, mset=None, gene_list=None,
+                        classif, mset=None,
+                        gene_list=None, exclude_samps=None,
                         test_indx=range(20), tune_indx=None,
                         final_fit=False, verbose=False):
         """Test a classifier using tuning and cross-validation
@@ -1066,6 +1089,14 @@ class MutExpr(object):
             curve metric.
         """
         train_expr,train_mut,train_cv = self.training(mset, gene_list)
+        if exclude_samps is not None:
+            use_samps = [s for s,m in zip(train_expr.index,train_mut)
+                         if s not in exclude_samps or m]
+            use_indx = set([i for i,s in enumerate(train_expr.index)
+                        if s in use_samps])
+            train_cv = [(np.array(list(set(tr) & use_indx)),
+                         np.array(list(set(tst) & use_indx)))
+                         for tr,tst in train_cv]
         test_cvs = [x for i,x in enumerate(train_cv)
                     if i in test_indx]
         if tune_indx is not None:
@@ -1080,6 +1111,10 @@ class MutExpr(object):
             scoring=_score_auc, cv=test_cvs, n_jobs=-1
             ), 25)
         if final_fit:
+            if exclude_samps is not None:
+                train_mut = [m for s,m in zip(train_expr.index,train_mut)
+                             if s in use_samps]
+                train_expr = train_expr.loc[use_samps,:]
             classif.fit(X=train_expr, y=train_mut)
         return perf
 
