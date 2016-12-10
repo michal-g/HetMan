@@ -8,6 +8,7 @@ formats that facilitate classification of mutation sub-types.
 
 # Author: Michal Grzadkowski <grzadkow@ohsu.edu>
 
+import synapseclient
 import numpy as np
 import pandas as pd
 import re
@@ -25,6 +26,15 @@ from hetman_classif import _score_auc
 _base_dir = '/home/users/grzadkow/compbio/'
 _data_dir = _base_dir + 'input-data/ICGC/raw/'
 _cv_dir = _base_dir + 'auxiliary/HetMan/cv-samples/'
+
+
+# .. mutation data types for use with MC3 TCGA data ..
+_mc3_levels = {
+    'Gene':((np.str_, 16), 0),
+    'Conseq':((np.str_, 32), 8),
+    'Exon':((np.str_, 8), 38),
+    'Protein':((np.str_, 16), 36)
+    }
 
 
 # .. helper functions for reading in genomic data from files downloaded
@@ -96,10 +106,13 @@ def _read_expr(expr_file):
     """
     expr = pd.read_table(
             expr_file,
-            usecols=(0,7,8), header=0,
+            usecols=(4,7,8), header=0,
             names=('Sample', 'Gene', 'FPKM'),
             dtype={'Sample':'a64', 'Gene':'a64', 'FPKM':'f4'}
             )
+    expr['Sample'] = [reduce(lambda x,y: x+'-'+y,
+                             s.split('-', 3)[:3])
+                      for s in expr['Sample']]
     
     # transforms raw long-format expression data into wide-format
     return expr.pivot_table(
@@ -108,7 +121,25 @@ def _read_expr(expr_file):
         )
 
 
-def _read_mut(mut_file):
+def _read_mut(syn, mut_levels=('Gene','Conseq','Exon')):
+    """Reads mutation data from MC3"""
+    mc3 = syn.get('syn7824274')
+    data_types = [('Sample', np.str_, 32)]
+    use_cols = [15]
+    for lvl in mut_levels:
+        data_types.append(((lvl,) + _mc3_levels[lvl][0]))
+        use_cols += [_mc3_levels[lvl][1]]
+    muts = np.loadtxt(
+        fname=mc3.path, dtype=data_types, skiprows=1,
+        delimiter='\t', usecols=use_cols
+        )
+    muts['Sample'] = [reduce(lambda x,y: x+'-'+y,
+                             s.split('-', 3)[:3])
+                      for s in muts['Sample']]
+    return muts
+
+
+def _read_mut_icgc(mut_file):
     """Gets mutation data as an numpy array from an ICGC tsv.gz file.
 
     Parameters
@@ -177,10 +208,9 @@ class MuTree(object):
         Which samples' mutation data to include in the tree. Note that samples
         without mutations will be in the tree regardless.
     
-    genes : dict
-        A list of genes whose mutation data are to be included in the tree,
-        with Ensembl IDs as keys and gene names as values.
-        i.e. {'ENSG00000141510':'TP53', 'ENSG00000157764':'BRAF'}
+    genes : list
+        A list of genes whose mutation data are to be included in the tree.
+        i.e. ['TP53', 'ATM']
 
     levels : tuple, shape (child_levels,) or ((), (child_levels,)) or
              ((parent_levels,), (child_levels,))
@@ -222,62 +252,52 @@ class MuTree(object):
         # handles the possible mutation hierarchy levels
         null_arr = np.empty(shape=0, dtype=muts.dtype)
         if self.level_ == 'Gene':
-            new_muts = {g:muts[muts['Gene'] == v]
-                        for g,v in genes.items()}
+            new_muts = {g:muts[muts['Gene'] == g] for g in genes}
             new_samps = {g:(samples & set(new_muts[g]['Sample']))
-                         for g in genes.keys()}
+                         for g in genes}
 
         elif self.level_ == 'Conseq':
             new_muts = {}
             new_samps = {}
             for s in samples:
                 mut_s = muts[muts['Sample'] == s]
-                for nm in set(mut_s['Name']):
-                    nm_mut = mut_s[mut_s['Name'] == nm]
-                    nm_mut.sort(order='Transcript')
-                    presence = tuple(x['Protein'] != '' for x in nm_mut)
-                    conseqs = set([
-                        x for (x,y) in zip(
-                            tuple(x['Consequence'] for x in nm_mut),
-                            presence)
-                        if y
-                        ])
-                    for c in conseqs:
-                        add_samp = (new_samps.get(c, set()) | set([s]))
-                        new_samps.update({c:add_samp})
-                        add_mut = np.concatenate((new_muts.get(c, null_arr),
-                                                 nm_mut))
-                        new_muts.update({c:add_mut})
+                conseqs = set(mut_s['Conseq'])
+                for c in conseqs:
+                    mut_c = mut_s[mut_s['Conseq'] == c]
+                    c_lab = re.sub('_(Del|Ins)', '', c)
+                    add_samp = new_samps.get(c_lab, set()) | set([s])
+                    new_samps.update({c_lab:add_samp})
+                    add_mut = np.concatenate(
+                        (new_muts.get(c_lab, null_arr), mut_c))
+                    new_muts.update({c_lab:add_mut})
 
         elif self.level_ == 'Exon':
             new_samps = {}
             new_muts = {}
             for s in samples:
                 mut_s = muts[muts['Sample'] == s]
-                for nm in set(mut_s['Name']):
-                    nm_mut = mut_s[mut_s['Name'] == nm]
-                    nm_mut.sort(order='Transcript')
+                exons = set(mut_s['Exon'])
+                for ex in exons:
+                    mut_ex = mut_s[mut_s['Exon'] == ex]
+                    add_samp = new_samps.get(ex, set()) | set([s])
+                    new_samps.update({ex:add_samp})
+                    add_mut = np.concatenate((new_muts.get(ex, null_arr),
+                                              mut_ex))
+                    new_muts.update({ex:add_mut})
 
-                    # fixes ICGC bug where transcript-level entries are
-                    # sometimes duplicated
-                    trx_len = len(nm_mut['Transcript'])
-                    trx_count = len(set(nm_mut['Transcript']))
-                    if (trx_len > trx_count and (trx_len % trx_count) == 0
-                        and all([len(set([x['Protein'] for x in v])) == 1 for k,v
-                                 in groupby(nm_mut, lambda x: x['Transcript'])])):
-                        nm_mut = nm_mut[:trx_count]
-
-                    exons = reduce(
-                        lambda x,y: x+y,
-                        ['o' if x else 'x'
-                         for x in tuple(x['Protein'] != ''
-                                        for x in nm_mut)]
-                        )
-                    add_samp = (new_samps.get(exons, set()) | set([s]))
-                    new_samps.update({exons:add_samp})
-                    add_mut = np.concatenate((new_muts.get(exons, null_arr),
-                                             nm_mut))
-                    new_muts.update({exons:add_mut})
+        elif self.level_ == 'Protein':
+            new_samps = {}
+            new_muts = {}
+            for s in samples:
+                mut_s = muts[muts['Sample'] == s]
+                proteins = set(mut_s['Protein'])
+                for p in proteins:
+                    mut_p = mut_s[mut_s['Protein'] == p]
+                    add_samp = new_samps.get(p, set()) | set([s])
+                    new_samps.update({p:add_samp})
+                    add_mut = np.concatenate((new_muts.get(p, null_arr),
+                                              mut_p))
+                    new_muts.update({p:add_mut})
 
         # unless we have reached the final level, recurse down
         # to the next level
@@ -342,6 +362,28 @@ class MuTree(object):
                     else:
                         samps |= v
         return samps
+
+    def get_overlap(self, mset1, mset2):
+        """Gets the proportion of samples in one mset that also fall under
+           another, taking the maximum of the two possible mset orders.
+
+        Parameters
+        ----------
+        mset1,mset2 : MutSets
+            The mutation sets to be compared.
+
+        Returns
+        -------
+        O : float
+            The ratio of overlap between the two given sets.
+        """
+        samps1 = self.get_samples(mset1)
+        samps2 = self.get_samples(mset2)
+        if len(samps1) and len(samps2):
+            ovlp = float(len(samps1 & samps2))
+            return max(ovlp / len(samps1), ovlp / len(samps2))
+        else:
+            return 0
 
     def add_cnvs(self, mut_gene, cnvs):
         """Adds a list of copy number variations for the given gene to the
@@ -711,13 +753,13 @@ class MutSet(object):
         other_set = set(other.child.keys()) - set(self.child.keys())
         both_set = set(self.child.keys()) & set(other.child.keys())
 
-        if len(self_set) > 0:
+        if self_set:
             new_key.update({(self.level_, k):self.child[k]
                             for k in self_set})
-        if len(other_set) > 0:
+        if other_set:
             new_key.update({(other.level_, k):other.child[k]
                             for k in other_set})
-        if len(both_set) > 0:
+        if both_set:
             new_key.update(dict(tuple((
                 tuple((self.level_, k)), self.child[k]))
                 if self.child[k] == other.child[k]
@@ -725,6 +767,36 @@ class MutSet(object):
                             self.child[k] | other.child[k]))
                 for k in both_set))
         return MutSet(new_key)
+
+    def __and__(self, other):
+        """Finds the intersection of two MutSets."""
+        if self.level_ != other.level_:
+            raise HetmanDataError('mismatching MutSet levels')
+        new_key = {}
+        self_keys = reduce(lambda x,y: x|y, self.child.keys())
+        other_keys = reduce(lambda x,y: x|y, other.child.keys())
+        self_refact = {x:reduce(lambda x,y: x|y,
+                                [v for k,v in self.child.items() if x in k])
+                       for x in self_keys}
+        other_refact = {x:reduce(lambda x,y: x|y,
+                                 [v for k,v in other.child.items() if x in k])
+                        for x in other_keys}
+        both_set = list(set(self_refact) & set(other_refact))
+        for k in both_set:
+            if self_refact[k] is None:
+                new_key.update({(self.level_, k):other_refact[k]})
+            elif other_refact[k] is None:
+                new_key.update({(self.level_, k):self_refact[k]})
+            elif self_refact[k] == other_refact[k]:
+                new_key.update({(self.level_, k):self_refact[k]})
+            else:
+                intx = self_refact[k] & other_refact[k]
+                if intx is not None:
+                    new_key.update({(self.level_, k):intx})
+        if new_key:
+            return MutSet(new_key)
+        else:
+            return None
 
     def __ge__(self, other):
         """Checks if one MutSet is a subset of the other."""
@@ -866,16 +938,15 @@ class MutExpr(object):
         Mean CNV scores for genes whose mutations we want to consider.
     """
 
-    def __init__(self,
+    def __init__(self, syn,
                  project, mut_genes, cv_info=None,
                  mut_levels = ('Gene', 'Conseq', 'Exon'), load_cnv=False):
 
-        # loads gene expression and annotation data
+        # loads gene expression and annotation data, mutation data
         self.project_ = project
         annot = _read_annot()
         expr = _read_expr(_data_dir + project + '/exp_seq.tsv.gz')
-        mut = _read_mut(_data_dir + project +
-                        '/simple_somatic_mutation.open.tsv.gz')
+        muts = _read_mut(syn, mut_levels)
 
         # filters out genes that are not expressed in any samples, don't have
         # any variation across the samples, are not included in the
@@ -893,7 +964,7 @@ class MutExpr(object):
                       if a['gene_name'] == mut_g}
         annot_ids = {k:v['ID'] for k,v in annot_data.items()}
         self.annot = annot
-        samples = frozenset(set(mut['Sample']) & set(expr.index))
+        samples = frozenset(set(muts['Sample']) & set(expr.index))
 
         # if cross-validation info is specified, get list of samples used for
         # training and testing after filtering out those for which we don't
@@ -916,12 +987,12 @@ class MutExpr(object):
             self.train_expr_ = expr.loc[self.train_samps_, :]
             self.test_expr_ = expr.loc[samples - self.train_samps_, :]
             self.train_mut_ = MuTree(
-                muts=mut, samples=self.train_samps_,
-                genes=annot_ids, levels=mut_levels
+                muts=muts, samples=self.train_samps_,
+                genes=mut_genes, levels=mut_levels
                 )
             self.test_mut_ = MuTree(
-                muts=mut, samples=(samples - self.train_samps_),
-                genes=annot_ids, levels=mut_levels
+                muts=muts, samples=(samples - self.train_samps_),
+                genes=mut_genes, levels=mut_levels
                 )
             self.cv_index_ = cv_info['Sample'] ** 2
 
@@ -931,8 +1002,8 @@ class MutExpr(object):
             self.train_samps_ = None
             self.train_expr_ = _norm_expr(expr.loc[samples, :])
             self.train_mut_ = MuTree(
-                muts=mut, samples=samples,
-                genes=annot_ids, levels=mut_levels
+                muts=muts, samples=samples,
+                genes=mut_genes, levels=mut_levels
                 )
             self.cv_index_ = 0
 
