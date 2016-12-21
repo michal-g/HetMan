@@ -16,10 +16,11 @@ import defunct
 import operator
 
 from itertools import combinations as combn
-from itertools import groupby
-from math import log
+from itertools import groupby, product
+from math import log, ceil
 from sklearn import model_selection
-from hetman_classif import _score_auc
+from classif import _score_auc
+from scipy.stats import fisher_exact
 
 
 # .. directories containing raw -omics data and cross-validation samples ..
@@ -122,7 +123,23 @@ def _read_expr(expr_file):
 
 
 def _read_mut(syn, mut_levels=('Gene','Conseq','Exon')):
-    """Reads mutation data from MC3"""
+    """Reads ICGC mutation data from the MC3 synapse file.
+
+    Parameters
+    ----------
+    syn : object
+        An instance of Synapse that has already been logged into.
+
+    mut_levels : tuple of strs
+        A list of mutation levels, must be in the keys of the _mc3_levels
+        dict defined above.
+
+    Returns
+    -------
+    muts : array of shape (n_mutations, mut_levels+1)
+        A mutation array, with a row for each mutation appearing in an
+        individual sample.
+    """
     mc3 = syn.get('syn7824274')
     data_types = [('Sample', np.str_, 32)]
     use_cols = [15]
@@ -141,6 +158,7 @@ def _read_mut(syn, mut_levels=('Gene','Conseq','Exon')):
 
 def _read_mut_icgc(mut_file):
     """Gets mutation data as an numpy array from an ICGC tsv.gz file.
+       Deprecated in favour of using MC3 mutation calls.
 
     Parameters
     ----------
@@ -206,7 +224,7 @@ class MuTree(object):
         
     samples : array-like, shape (n_samples,)
         Which samples' mutation data to include in the tree. Note that samples
-        without mutations will be in the tree regardless.
+        without any mutations will not be in the tree regardless.
     
     genes : list
         A list of genes whose mutation data are to be included in the tree.
@@ -220,9 +238,7 @@ class MuTree(object):
         The Gene level corresponds to which gene is mutated (i.e. TP53, AML3),
         the Conseq level corresponds to the consequence of the mutation on the
         transcribed protein (i.e. missense, frameshift), the Exon level
-        corresponds how the exon position of the mutation affects the possible
-        transcripts of the gene (i.e. 10100 if only the 1st and 3rd of the five
-        transcripts of the gene are affected by the mutation).
+        corresponds to which Exon the mutation affects, if applicable.
 
         Mutation trees can either have other mutation trees as children,
         corresponding to lower levels in the hierarchy, or have sets of
@@ -231,52 +247,53 @@ class MuTree(object):
 
     Attributes
     ----------
-    levels_ : tuple, shape ((parent_levels,), (child_levels,))
-        A list of mutation levels that are included in this tree as well as its
-        parents and children.
-        
-    level_ : str
-        The mutation level at the head of this mutation tree.
-
+    branches_ : set of strs
+        The branches at this level of the hierarchy, i.e. the set of genes, set
+        of possible consequences, etc.
     """
 
     def __init__(self,
                  muts, samples, genes,
                  levels=('Gene', 'Conseq', 'Exon')):
         if isinstance(levels[0], str):
-            self.levels_ = ((),levels)
+            self.levels = ((),levels)
         else:
-            self.levels_ = levels
-        self.level_ = self.levels_[1][0]
+            self.levels = levels
+        self.cur_level = self.levels[1][0]
 
         # handles the possible mutation hierarchy levels
         null_arr = np.empty(shape=0, dtype=muts.dtype)
-        if self.level_ == 'Gene':
+        if self.cur_level == 'Gene':
+            self.branches_ = set(genes)
             new_muts = {g:muts[muts['Gene'] == g] for g in genes}
             new_samps = {g:(samples & set(new_muts[g]['Sample']))
                          for g in genes}
 
-        elif self.level_ == 'Conseq':
+        elif self.cur_level == 'Conseq':
             new_muts = {}
             new_samps = {}
+            self.branches_ = set()
             for s in samples:
                 mut_s = muts[muts['Sample'] == s]
                 conseqs = set(mut_s['Conseq'])
                 for c in conseqs:
                     mut_c = mut_s[mut_s['Conseq'] == c]
                     c_lab = re.sub('_(Del|Ins)', '', c)
+                    self.branches_ |= set([c_lab])
                     add_samp = new_samps.get(c_lab, set()) | set([s])
                     new_samps.update({c_lab:add_samp})
                     add_mut = np.concatenate(
                         (new_muts.get(c_lab, null_arr), mut_c))
                     new_muts.update({c_lab:add_mut})
 
-        elif self.level_ == 'Exon':
+        elif self.cur_level == 'Exon':
             new_samps = {}
             new_muts = {}
+            self.branches_ = set()
             for s in samples:
                 mut_s = muts[muts['Sample'] == s]
                 exons = set(mut_s['Exon'])
+                self.branches_ |= exons
                 for ex in exons:
                     mut_ex = mut_s[mut_s['Exon'] == ex]
                     add_samp = new_samps.get(ex, set()) | set([s])
@@ -285,12 +302,14 @@ class MuTree(object):
                                               mut_ex))
                     new_muts.update({ex:add_mut})
 
-        elif self.level_ == 'Protein':
+        elif self.cur_level == 'Protein':
             new_samps = {}
             new_muts = {}
+            self.branches_ = set()
             for s in samples:
                 mut_s = muts[muts['Sample'] == s]
                 proteins = set(mut_s['Protein'])
+                self.branches_ |= proteins
                 for p in proteins:
                     mut_p = mut_s[mut_s['Protein'] == p]
                     add_samp = new_samps.get(p, set()) | set([s])
@@ -301,12 +320,12 @@ class MuTree(object):
 
         # unless we have reached the final level, recurse down
         # to the next level
-        if len(self.levels_[1]) > 1:
+        if len(self.levels[1]) > 1:
             self.child = {g:MuTree(
                 muts=new_muts[g],
                 samples=(samples & set(new_samps[g])), genes=genes,
-                levels=(self.levels_[0] + (self.level_,),
-                        self.levels_[1][1:])
+                levels=(self.levels[0] + (self.cur_level,),
+                        self.levels[1][1:])
                 ) for g in new_muts.keys()}
         else:
             self.child = {g:frozenset(tuple(new_samps[g]))
@@ -315,19 +334,19 @@ class MuTree(object):
     def __str__(self):
         """Printing a MuTree shows each of the branches of the tree and
            the samples at the end of each branch."""
-        new_str = self.level_
+        new_str = self.cur_level
         for k,v in self.child.items():
             new_str = new_str + ' IS ' + k
             if isinstance(v, MuTree):
                 new_str = (new_str + ' AND '
-                           + '\n' + '\t'*(len(self.levels_[0])+1) + str(v))
+                           + '\n' + '\t'*(len(self.levels[0])+1) + str(v))
             else:
                 if len(v) > 15:
                     new_str = new_str + ': (' + str(len(v)) + ' samples)'
                 else:
                     new_str = (new_str + ': '
                                + reduce(lambda x,y: x + ',' + y, tuple(v)))
-            new_str = new_str + '\n' + '\t'*len(self.levels_[0])
+            new_str = new_str + '\n' + '\t'*len(self.levels[0])
         new_str = re.sub('\n$', '', new_str)
         return new_str
 
@@ -374,16 +393,17 @@ class MuTree(object):
 
         Returns
         -------
-        O : float
+        ov : float
             The ratio of overlap between the two given sets.
         """
         samps1 = self.get_samples(mset1)
         samps2 = self.get_samples(mset2)
         if len(samps1) and len(samps2):
             ovlp = float(len(samps1 & samps2))
-            return max(ovlp / len(samps1), ovlp / len(samps2))
+            ov = max(ovlp / len(samps1), ovlp / len(samps2))
         else:
-            return 0
+            ov = 0
+        return ov
 
     def add_cnvs(self, mut_gene, cnvs):
         """Adds a list of copy number variations for the given gene to the
@@ -400,7 +420,7 @@ class MuTree(object):
             A dictionary with "Gain" and/or "Loss" as keys and individual
             samples as values.
         """
-        if self.level_ != 'Gene':
+        if self.cur_level != 'Gene':
             raise HetmanDataError("CNVs can only be added to the "
                                   "<Gene> level of a mutation tree.")
         if not mut_gene in self.child.keys():
@@ -430,12 +450,14 @@ class MuTree(object):
             a MutSet object (see below).
         """
         if levels is None:
-            levels = self.levels_[1]
-        return {(self.level_, k):(v.allkey(levels) 
-                                  if (isinstance(v, MuTree)
-                                      and self.level_ != levels[-1])
-                                  else None)
-                for k,v in self.child.items()}
+            levels = self.levels[1]
+        return {
+            (self.cur_level, k):(v.allkey(levels)
+                                 if (isinstance(v, MuTree)
+                                     and self.cur_level != levels[-1])
+                                 else None)
+            for k,v in self.child.items()
+            }
 
     def subsets(self, mset=None, levels=None):
         """Gets all of the MutSets corresponding to exactly one of the
@@ -459,35 +481,39 @@ class MuTree(object):
         if mset is None:
             mset = MutSet(self.allkey(levels))
         if levels is None:
-            levels = self.levels_[1]
+            levels = self.levels[1]
         msets = []
-        if self.level_ != levels[-1]:
+        if self.cur_level != levels[-1]:
             for k,v in self.child.items():
                 for l,w in mset.child.items():
                     if k in l:
                         if isinstance(v, MuTree):
-                            msets += [MutSet({(self.level_, k):s})
+                            msets += [MutSet({(self.cur_level, k):s})
                                       for s in v.subsets(w, levels)]
                         else:
-                            msets += [MutSet({(self.level_, k):None})
+                            msets += [MutSet({(self.cur_level, k):None})
                                       for k in (set(self.child.keys())
                                                 & reduce(lambda x,y: x|y,
                                                          mset.child.keys()))]
         else:
-            msets += [MutSet({(self.level_, k):None})
+            msets += [MutSet({(self.cur_level, k):None})
                       for k in (set(self.child.keys())
                                 & reduce(lambda x,y: x|y,
                                          mset.child.keys()))]
         return msets
 
-    def direct_subsets(self, mset):
+    def direct_subsets(self, mset, branches=None):
         """Gets all of the MutSets corresponding to direct descendants
-           of the given mutation set.
+           of the given branches of the given mutation set.
 
         Parameters
         ----------
         mset : MutSet
             A set of mutations whose direct descandants are to be obtained.
+
+        branches : set of strs, optional
+            A set of branches whose subsets are to be obtained, the default is
+            to use all available branches.
 
         Returns
         -------
@@ -495,23 +521,31 @@ class MuTree(object):
             A list of MutSets.
         """
         msets = []
-        if len(self.levels_[1]) > 1:
+        if len(self.levels[1]) > 1:
             for k,v in self.child.items():
                 for l,w in mset.child.items():
                     if k in l:
                         if w is not None:
-                            msets += [MutSet({(self.level_, k):s}) for s
-                                      in v.direct_subsets(w)]
-                        else:
-                            msets += [
-                                MutSet({(self.level_, k):
-                                        MutSet({(v.level_, x):None})})
-                                        for x in v.child.keys()]
+                            msets += [MutSet({(self.cur_level, k):s})
+                                      for s in v.direct_subsets(w, branches)]
+                        elif branches is None or k in branches:
+                            if isinstance(v, MuTree):
+                                msets += [
+                                    MutSet({(self.cur_level, k):
+                                            MutSet({(v.cur_level, x):None})})
+                                    for x in v.child.keys()
+                                    ]
+                            else:
+                                msets += [MutSet({(self.cur_level, k):None})]
         else:
-            msets += [MutSet({(self.level_, k):None})
-                      for k in (set(self.child.keys())
-                                & reduce(lambda x,y: x|y,
-                                         mset.child.keys()))]
+            if branches is None:
+                branches = self.branches_
+            msets += [
+                MutSet({(self.cur_level, k):None})
+                for k in (set(self.child.keys())
+                          & reduce(lambda x,y: x|y, mset.child.keys())
+                          & branches)
+                ]
         return msets
 
     def combsets(self,
@@ -551,9 +585,7 @@ class MuTree(object):
                     csets += [new_set]
         return csets
 
-    def partitions(self,
-                   mset=None, prop_use=0.1,
-                   max_part=25, exclude_parts=[]):
+    def partitions(self, mset, prop_use=0.1, max_part=25):
         """Gets the mutation subsets of this tree that are also subsets of
         the given mutation set and include or exclude at least the given
         proportion of samples contained herein. Only subsets at the same level
@@ -566,7 +598,7 @@ class MuTree(object):
 
         Parameters
         ----------
-        mset : MutSet, optional
+        mset : MutSet
             A set of mutations within which subsets are to be obtained.
 
         prop_use : float, optional
@@ -577,11 +609,6 @@ class MuTree(object):
         max_part : int
             The maximum number of mutation subsets that can be returned.
 
-        exclude_parts : list of MutSets
-            The list of mutation subsets that should be excluded from the
-            output, and also excluded from the threshold calculations listed
-            above.
-
         Returns
         -------
         psets : list
@@ -589,47 +616,51 @@ class MuTree(object):
         """
         # Get the list of possible branches to use for constructing subsets,
         # merge the smallest branches if the number of branches is too high.
-        subs = self.direct_subsets(mset)
-        subs_size = sorted(
-            [(x, float(len(self.get_samples(x)))) for x in subs],
-            key=lambda y: y[1],
-            reverse=True
-            )
-        while len(subs) > 10:
-            new_sub = subs[-2] | subs[-1]
-            subs = subs[:-1]
-            subs[-1] = new_sub
-            subs_size = sorted(
-                [(x, float(len(self.get_samples(x)))) for x in subs],
-                key=lambda y: y[1],
-                reverse=True
-                )
-        tot_samps = len(self.get_samples(mset))
-        find_part = False
+        sub_groups = [MutSet(m) for m in mset.subkeys()]
+        sub_list = [self.direct_subsets(m) for m in sub_groups]
+        for i in range(len(sub_list)):
+            if not sub_list[i]:
+                sub_list[i] = [sub_groups[i]]
+        sub_lens = [len(x) for x in sub_list]
+        if reduce(lambda x,y: (2**x - 1)*(2**y - 1), sub_lens) > max_part:
+            sub_sizes = [len(self.get_samples(m)) for m in sub_groups]
+            max_subs = [max_part ** (float(x)/sum(sub_sizes)) for x in sub_sizes]
+            for i in range(len(sub_list)):
+                if max_subs[i] > (2**sub_lens[i] - 1):
+                    for j in range(len(sub_list))[(i+1):]:
+                        max_subs[j] = (
+                            (max_subs[j] * (max_subs[i] / (2**sub_lens[i]-1)))
+                            ** (1.0 / (len(sub_list)-i-1)))
+                    max_subs[i] = (2**sub_lens[i] - 1)
+                sub_indx = sorted(
+                    [(x, float(len(self.get_samples(x)))) for x in sub_list[i]],
+                    key=lambda y: y[1],
+                    reverse=True
+                    )
+                while len(sub_indx) > max(ceil(log(max_subs[i], 2)), 1):
+                    new_sub = sub_indx[-2][0] | sub_indx[-1][0]
+                    sub_indx = sub_indx[:-2]
+                    new_indx = (new_sub, float(len(self.get_samples(new_sub))))
+                    sort_indx = sum([new_indx[1] < v for _,v in sub_indx])
+                    sub_indx.insert(sort_indx, new_indx)
+                sub_list[i] = [x[0] for x in sub_indx]
 
         # Get all possible combinations of the branches that satisfy the sample
         # size criteria. Tighten the criteria and merge the smallest branches
         # and redo if the number of combinations turns out to be too high.
-        while not find_part:
-            psets = []
-            for csize in range(1,len(subs)):
-                max_prop = sum([x[1] for x in subs_size[:csize]]) / tot_samps
-                min_prop = sum([x[1] for x in subs_size[-csize:]]) / tot_samps
-                if max_prop >= prop_use and min_prop <= (1-prop_use):
-                    for kc in combn(subs, csize):
-                        new_set = reduce(lambda x,y: x | y, kc)
-                        set_size = len(self.get_samples(new_set))
-                        if (set_size >= max((tot_samps*prop_use), 5) and
-                            set_size <= (tot_samps*(1-prop_use))):
-                            psets += [new_set]
-            psets = set(psets) - set(exclude_parts)
-            if len(psets) >= 2 and len(psets) <= max_part:
-                find_part = True
-            else:
-                prop_use = prop_use ** 0.7
-                subs_size = subs_size[:-1]
-                subs = [x[0] for x in subs_size]
-        return psets
+        tot_samps = len(self.get_samples(mset))
+        psets = []
+        for csizes in product(*[range(1, len(x)+1) for x in sub_list]):
+            for set_combn in product(
+                *[combn(sl, csize) for sl,csize in zip(sub_list,csizes)]):
+                set_comps = map(lambda x: reduce(lambda y,z: y|z, x),
+                                set_combn)
+                new_set = reduce(lambda x,y: x | y, set_comps)
+                set_size = len(self.get_samples(new_set))
+                if (set_size >= max((tot_samps*prop_use), 10)
+                    and set_size <= (tot_samps*(1-prop_use))):
+                    psets += [self.rationalize(new_set)]
+        return list(set(psets))
 
     def status(self, samples, mset=None):
         """For a given set of samples and a MutSet, finds if each sample
@@ -655,6 +686,38 @@ class MuTree(object):
             mset = MutSet(self.allkey())
         samp_list = self.get_samples(mset)
         return [s in samp_list for s in samples]
+
+    def rationalize(self, mset):
+        """Simplifies the structure of MutSet if it finds that some of its
+           branches correspond to the full set of branches possible in the
+           mutation hierarchy.
+        """
+        if mset.child == {frozenset(self.branches_): None}:
+            if self.levels[0]:
+                new_set = None
+            else:
+                new_set = MutSet(
+                    {(self.cur_level,tuple(self.branches_)):None})
+        elif len(self.levels[1]) == 1:
+            new_set = mset
+        else:
+            new_key = {}
+            for k,v in self.child.items():
+                for l,w in mset.child.items():
+                    if k in l:
+                        if w is not None:
+                            new_key.update([((self.cur_level,k),
+                                            v.rationalize(w))])
+                        else:
+                            new_key.update([((self.cur_level,k), None)])
+            new_set = MutSet(new_key)
+            if new_set.child == {frozenset(self.branches_): None}:
+                if self.levels[0]:
+                    new_set = None
+                else:
+                    new_set = MutSet(
+                        {(self.cur_level,tuple(self.branches_)):None})
+        return new_set
 
 
 class MutSet(object):
@@ -760,9 +823,11 @@ class MutSet(object):
             new_key.update({(other.level_, k):other.child[k]
                             for k in other_set})
         if both_set:
-            new_key.update(dict(tuple((
-                tuple((self.level_, k)), self.child[k]))
+            new_key.update(dict(
+                tuple((tuple((self.level_, k)), self.child[k]))
                 if self.child[k] == other.child[k]
+                else tuple((tuple((self.level_, k)), None))
+                if self.child[k] is None or other.child[k] is None
                 else tuple((tuple((self.level_, k)),
                             self.child[k] | other.child[k]))
                 for k in both_set))
@@ -849,16 +914,23 @@ class MutSet(object):
         """Subtracts one MutSet from another."""
         if self.level_ != other.level_:
             raise HetmanDataError("mismatching MutSet levels")
-        self_set = set(self.child.keys()) - set(other.child.keys())
-        both_set = set(self.child.keys()) & set(other.child.keys())
+        self_keys = reduce(lambda x,y: x|y, self.child.keys())
+        other_keys = reduce(lambda x,y: x|y, other.child.keys())
+        self_refact = {x:reduce(lambda x,y: x|y,
+                                [v for k,v in self.child.items() if x in k])
+                       for x in self_keys}
+        other_refact = {x:reduce(lambda x,y: x|y,
+                                 [v for k,v in other.child.items() if x in k])
+                        for x in other_keys}
         new_key = {}
-        if self_set:
-            new_key.update({(self.level_, k):self.child[k]
-                            for k in self_set})
-        if both_set:
-            new_key.update(dict(tuple((
-                tuple((self.level_, k)), self.child[k] - other.child[k]))
-                for k in both_set if self.child[k] != other.child[k]))
+        for k in self_refact:
+            if k in other_refact:
+                if (other_refact[k] is not None
+                    and self_refact[k] != other_refact[k]):
+                    sub_val = self_refact[k] - other_refact[k]
+                    new_key.update({(self.level_, k):sub_val})
+            else:
+                new_key.update({(self.level_, k):self_refact[k]})
         if new_key:
             return MutSet(new_key)
         else:
@@ -895,11 +967,15 @@ class MutExpr(object):
 
     Parameters
     ----------
+    syn : synapseclient object
+        A logged-into instance of the synapseclient.Synapse() class.
+
     project : str
-        An ICGC project.
+        An ICGC/TCGA project, i.e. BRCA-US or LGG-US
 
     mut_genes : list of strs
-        A list of genes whose mutations we want to consider.
+        A list of genes whose mutations we want to consider,
+        i.e. ['TP53','KRAS'].
 
     cv_info : dict, optional
         A dictionary with a Label field (i.e. 'two-thirds')
@@ -1038,6 +1114,34 @@ class MutExpr(object):
                                      {'Loss': loss_samps[0]})
             self.test_mut_.add_cnvs(cnv_def.mut_gene_,
                                     {'Loss': loss_samps[1]})
+
+    def mutex_test(self, mset1, mset2):
+        """Checks the mutual exclusivity of two mutation types in the
+           training data using a one-sided Fisher's exact test.
+
+        Parameters
+        ----------
+        mset1,mset2 : MutSets
+            The mutation types to be compared.
+
+        Returns
+        -------
+        pval : float
+            The p-value given by the test.
+        """
+        samps1 = self.train_mut_.get_samples(mset1)
+        samps2 = self.train_mut_.get_samples(mset2)
+        if not samps1 or not samps2:
+            raise HetmanDataError("Both sets must be non-empty!")
+        all_samps = set(self.train_expr_.index)
+        both_samps = samps1 & samps2
+        _,pval = fisher_exact(
+            [[len(all_samps - (samps1 | samps2)),
+              len(samps1 - both_samps)],
+             [len(samps2 - both_samps),
+              len(both_samps)]],
+            alternative='less')
+        return pval
 
     def training(self, mset=None, gene_list=None):
         """Gets the expression data and the mutation status corresponding
