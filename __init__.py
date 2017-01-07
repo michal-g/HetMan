@@ -1,6 +1,6 @@
 
 import data
 import classif
-import optim
+import loss_optim
 
 
