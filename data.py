@@ -8,18 +8,21 @@ formats that facilitate classification of mutation sub-types.
 
 # Author: Michal Grzadkowski <grzadkow@ohsu.edu>
 
-import synapseclient
 import numpy as np
 import pandas as pd
 import re
 import defunct
+import synapseclient
 
+from enum import Enum
 from itertools import combinations as combn
 from itertools import groupby, product
 from math import log, ceil
 from sklearn import model_selection
 from classif import _score_auc
 from scipy.stats import fisher_exact
+from sklearn.cluster import MeanShift
+from functools import reduce
 
 
 # .. directories containing raw -omics data and cross-validation samples ..
@@ -57,26 +60,27 @@ def _read_annot(version='v19'):
         Dictionary with keys corresponding to Ensembl gene IDs and values
         consisting of dicts with annotation fields.
     """
-    dt = np.dtype([('Chr','a64'), ('Type','a64'), ('Start','i4'),
-                   ('End','i4'), ('Annot','a2048')])
-    annot = np.loadtxt(
-        fname=(_base_dir + 'input-data/gencode.'
-               + version + '.annotation.gtf.gz'),
-        dtype=dt, usecols=(0,2,3,4,8), delimiter='\t'
+    annot = pd.read_csv(
+        _base_dir + 'input-data/gencode.' + version + '.annotation.gtf.gz',
+        usecols=[0,2,3,4,8], names=['Chr', 'Type', 'Start', 'End', 'Info'],
+        sep = '\t', header=None, comment='#'
         )
 
+    annot_dt = np.dtype([('Chr','a64'), ('Type','a64'),
+                         ('Start','i4'), ('End','i4'), ('Annot','a2048')])
     # filter out annotation records that aren't
     # protein-coding genes on non-sex chromosomes
-    chroms_use = ['chr' + str(i+1) for i in xrange(22)]
-    annot = annot[annot['Type'] == 'gene']
-    annot = annot[np.array([chrom in chroms_use for chrom in annot['Chr']])]
+    chroms_use = ['chr' + str(i+1) for i in range(22)]
+    annot = annot.loc[annot['Type'] == 'gene', ]
+    chr_indx = np.array([chrom in chroms_use for chrom in annot['Chr']])
+    annot = annot.loc[chr_indx, ]
     gn_annot = {
         re.sub('\.[0-9]+', '', z['gene_id']).replace('"', ''):z
         for z in [dict([['chr', an['Chr']]] +
                        [['Start', an['Start']]] +
                        [['End', an['End']]] +
                        [y for y in [x.split(' ')
-                                    for x in an['Annot'].split('; ')]
+                                    for x in an['Info'].split('; ')]
                         if len(y) == 2])
                   for an in annot]
         if z['gene_type'] == '"protein_coding"'
@@ -98,14 +102,15 @@ def _read_expr(expr_file):
     Returns
     -------
     expr : ndarray, shape (n_samples, n_features)
-        An expression matrix with genes as features, in the case of duplicate
-        gene names values are averaged.
+        An expression matrix with genes as features, in the case of
+        duplicate gene names values are averaged.
     """
-    expr = pd.read_table(
-            expr_file, usecols=(4,7,8), header=0,
-            names=('Sample', 'Gene', 'FPKM'),
-            dtype={'Sample':'a64', 'Gene':'a64', 'FPKM':'f4'}
-            )
+    expr = pd.read_csv(
+        expr_file, usecols=(4,7,8), header=0, sep = '\t',
+        names=('Sample', 'Gene', 'FPKM')
+        )
+
+    # gets patient IDs from TCGA barcodes
     expr['Sample'] = [reduce(lambda x,y: x + '-' + y,
                              s.split('-', 3)[:3])
                       for s in expr['Sample']]
@@ -134,18 +139,22 @@ def _read_mut(syn, mut_levels=('Gene','Conseq','Exon')):
         individual sample.
     """
     mc3 = syn.get('syn7824274')
-    data_types = [('Sample', np.str_, 32)]
-    use_cols = [15]
+    data_names = ['Sample', 'SIFT', 'PolyPhen'] + list(mut_levels)
+    use_cols = [15,71,72]
     for lvl in mut_levels:
-        data_types.append(((lvl,) + _mc3_levels[lvl][0]))
         use_cols += [_mc3_levels[lvl][1]]
-    muts = np.loadtxt(
-        fname=mc3.path, dtype=data_types, skiprows=1,
-        delimiter='\t', usecols=use_cols
-        )
+    muts = pd.read_csv(
+        mc3.path, usecols=use_cols, sep='\t', header=None,
+        names=data_names, comment='#', skiprows=1)
     muts['Sample'] = [reduce(lambda x,y: x+'-'+y,
                              s.split('-', 3)[:3])
                       for s in muts['Sample']]
+    muts['SIFT'] = [re.sub('\)$', '', re.sub('^.*\(', '', x))
+                    if x != '.' else 0
+                    for x in muts['SIFT']]
+    muts['PolyPhen'] = [re.sub('\)$', '', re.sub('^.*\(', '', x))
+                        if x != '.' else 0
+                        for x in muts['PolyPhen']]
     return muts
 
 
@@ -201,6 +210,17 @@ def _read_cnv(cnv_file):
 class HetmanDataError(Exception):
     """Class for exceptions thrown by classes in the Hetman data module."""
     pass
+
+
+class MutLevel(Enum):
+    """A class corresponding to the various levels of mutation properties
+       supported by HetMan.
+    """
+    Gene = 1
+    Form = 2
+    Severity = 3
+    Exon = 4
+    Protein = 5
 
 
 class MuTree(object):
@@ -281,6 +301,23 @@ class MuTree(object):
                     add_mut = np.concatenate(
                         (new_muts.get(c_lab, null_arr), mut_c))
                     new_muts.update({c_lab:add_mut})
+            if 'Missense_Mutation' in new_muts:
+                mshift = MeanShift()
+                mshift.fit(
+                    new_muts['Missense_Mutation']['PolyPhen'].reshape(-1,1))
+                sev_labs = ['MM_PolyPhen_' + str(round(x,2))
+                            for x in mshift.cluster_centers_]
+                for i in range(len(sev_labs)):
+                    new_muts.update({
+                        sev_labs[i]:
+                        new_muts['Missense_Mutation'][mshift.labels_ == i, ]
+                        })
+                    new_samps.update({
+                        sev_labs[i]:
+                        set(new_muts['Missense_Mutation']['Sample']
+                            [mshift.labels_ == i, ])})
+                del new_muts['Missense_Mutation']
+                del new_samps['Missense_Mutation']
 
         elif self.cur_level == 'Exon':
             new_samps = {}
@@ -322,16 +359,16 @@ class MuTree(object):
                 samples=(samples & set(new_samps[g])), genes=genes,
                 levels=(self.levels[0] + (self.cur_level,),
                         self.levels[1][1:])
-                ) for g in new_muts.keys()}
+                ) for g in list(new_muts.keys())}
         else:
             self.child = {g:frozenset(tuple(new_samps[g]))
-                          for g in new_muts.keys()}
+                          for g in list(new_muts.keys())}
 
     def __str__(self):
         """Printing a MuTree shows each of the branches of the tree and
            the samples at the end of each branch."""
         new_str = self.cur_level
-        for k,v in self.child.items():
+        for k,v in list(self.child.items()):
             new_str = new_str + ' IS ' + k
             if isinstance(v, MuTree):
                 new_str = (new_str + ' AND '
@@ -353,7 +390,7 @@ class MuTree(object):
     def get_samples(self):
         """Gets the set of unique samples contained within the tree."""
         samps = set()
-        for v in self.child.values():
+        for v in list(self.child.values()):
             if isinstance(v, MuTree):
                 samps |= v.get_samples()
             else:
@@ -364,7 +401,7 @@ class MuTree(object):
         """Gets the number of branches of this tree each of the given
            samples appears in."""
         samp_count = {s:0 for s in samps}
-        for v in self.child.values():
+        for v in list(self.child.values()):
             if isinstance(v, MuTree):
                 new_counts = v.get_samp_count(samps)
                 samp_count.update(
@@ -414,10 +451,10 @@ class MuTree(object):
         if self.cur_level != 'Gene':
             raise HetmanDataError("CNVs can only be added to the "
                                   "<Gene> level of a mutation tree.")
-        if not mut_gene in self.child.keys():
+        if not mut_gene in list(self.child.keys()):
             raise HetmanDataError("CNVs can only be added to a gene "
                                   "already in the tree.")
-        for k,v in cnvs.items():
+        for k,v in list(cnvs.items()):
             if v:
                 self.child[mut_gene].child['Loss'] = frozenset(v)
 
@@ -447,7 +484,7 @@ class MuTree(object):
                                  if (isinstance(v, MuTree)
                                      and self.cur_level != levels[-1])
                                  else None)
-            for k,v in self.child.items()
+            for k,v in list(self.child.items())
             }
 
     def subsets(self, mtype=None, levels=None):
@@ -475,8 +512,8 @@ class MuTree(object):
             levels = self.levels[1]
         mtypes = []
         if self.cur_level != levels[-1]:
-            for k,v in self.child.items():
-                for l,w in mtype.child.items():
+            for k,v in list(self.child.items()):
+                for l,w in list(mtype.child.items()):
                     if k in l:
                         if isinstance(v, MuTree):
                             mtypes += [MuType({(self.cur_level, k):s})
@@ -485,12 +522,12 @@ class MuTree(object):
                             mtypes += [MuType({(self.cur_level, k):None})
                                       for k in (set(self.child.keys())
                                                 & reduce(lambda x,y: x|y,
-                                                         mtype.child.keys()))]
+                                                         list(mtype.child.keys())))]
         else:
             mtypes += [MuType({(self.cur_level, k):None})
                       for k in (set(self.child.keys())
                                 & reduce(lambda x,y: x|y,
-                                         mtype.child.keys()))]
+                                         list(mtype.child.keys())))]
         return mtypes
 
     def direct_subsets(self, mtype, branches=None):
@@ -513,8 +550,8 @@ class MuTree(object):
         """
         mtypes = []
         if len(self.levels[1]) > 1:
-            for k,v in self.child.items():
-                for l,w in mtype.child.items():
+            for k,v in list(self.child.items()):
+                for l,w in list(mtype.child.items()):
                     if k in l:
                         if w is not None:
                             mtypes += [MuType({(self.cur_level, k):s})
@@ -524,7 +561,7 @@ class MuTree(object):
                                 mtypes += [
                                     MuType({(self.cur_level, k):
                                             MuType({(v.cur_level, x):None})})
-                                    for x in v.child.keys()
+                                    for x in list(v.child.keys())
                                     ]
                             else:
                                 mtypes += [MuType({(self.cur_level, k):None})]
@@ -534,7 +571,7 @@ class MuTree(object):
             mtypes += [
                 MuType({(self.cur_level, k):None})
                 for k in (set(self.child.keys())
-                          & reduce(lambda x,y: x|y, mtype.child.keys())
+                          & reduce(lambda x,y: x|y, list(mtype.child.keys()))
                           & branches)
                 ]
         return mtypes
@@ -745,7 +782,7 @@ class MutSet(object):
             samps = (self.muts1.get_samples(mtree)
                      | (mtree.get_samples() - self.muts2.get_samples(mtree)))
         return samps
-    
+
     def rationalize(self, mtree):
         new_muts1 = self.muts1.rationalize(mtree)
         new_muts2 = self.muts2.rationalize(mtree)
@@ -796,7 +833,7 @@ class MuType(object):
     def __init__(self, set_key):
         # gets the mutation hierarchy level of this set, makes sure
         # the key is properly specified
-        level = set(k for k,_ in set_key.keys())
+        level = set(k for k,_ in list(set_key.keys()))
         if len(level) > 1:
             raise HetmanDataError(
                 "improperly defined MuType key (multiple mutation levels)")
@@ -804,18 +841,18 @@ class MuType(object):
 
         # gets the subsets of mutations defined at this level, and
         # their further subdivisions if they exist
-        membs = [(k,) if isinstance(k, str) else k for _,k in set_key.keys()]
+        membs = [(k,) if isinstance(k, str) else k for _,k in list(set_key.keys())]
         children = dict(
             tuple((v, ch)) if isinstance(ch, MuType) or ch is None else
             tuple((v, MuType(ch)))
-            for v,ch in zip(membs, set_key.values())
+            for v,ch in zip(membs, list(set_key.values()))
             )
 
         # merges subsets at this level if their children are the same, i.e.
         # missense:None, frameshift:None => (missense,frameshift):None
         uniq_ch = set(children.values())
         self.child = {frozenset(i for j in
-                                [k for k,v in children.items() if v == ch]
+                                [k for k,v in list(children.items()) if v == ch]
                                 for i in j):ch for ch in uniq_ch}
 
     def __eq__(self, other):
@@ -835,7 +872,7 @@ class MuType(object):
         new_str = ''
         if self.level_ == 'Gene':
             new_str += 'a mutation where '
-        for k,v in self.child.items():
+        for k,v in list(self.child.items()):
             new_str += (self.level_ + ' IS '
                         + reduce(lambda x,y: x + ' OR ' + y, k))
             if v is not None:
@@ -845,9 +882,9 @@ class MuType(object):
 
     def _raw_key(self):
         "Returns the expanded key of a MuType."
-        rmembs = reduce(lambda x,y: x|y, self.child.keys())
+        rmembs = reduce(lambda x,y: x|y, list(self.child.keys()))
         return {memb:reduce(lambda x,y: x|y,
-                            [v for k,v in self.child.items() if memb in k])
+                            [v for k,v in list(self.child.items()) if memb in k])
                 for memb in rmembs}
 
     def __or__(self, other):
@@ -914,13 +951,13 @@ class MuType(object):
         """Checks if one MuType is a subset of the other."""
         if self.level_ != other.level_:
             raise HetmanDataError('mismatching MuType levels')
-        self_keys = reduce(lambda x,y: x|y, self.child.keys())
-        other_keys = reduce(lambda x,y: x|y, other.child.keys())
+        self_keys = reduce(lambda x,y: x|y, list(self.child.keys()))
+        other_keys = reduce(lambda x,y: x|y, list(other.child.keys()))
         self_keys = {x:reduce(lambda x,y: x|y,
-                                [v for k,v in self.child.items() if x in k])
+                                [v for k,v in list(self.child.items()) if x in k])
                        for x in self_keys}
         other_keys = {x:reduce(lambda x,y: x|y,
-                                 [v for k,v in other.child.items() if x in k])
+                                 [v for k,v in list(other.child.items()) if x in k])
                         for x in other_keys}
         if set(self_keys) >= set(other_keys):
             return all([True if self_keys[k] is None
@@ -934,13 +971,13 @@ class MuType(object):
         """Checks if one MuType is a proper subset of the other."""
         if self.level_ != other.level_:
             raise HetmanDataError('mismatching MuType levels')
-        self_keys = reduce(lambda x,y: x|y, self.child.keys())
-        other_keys = reduce(lambda x,y: x|y, other.child.keys())
+        self_keys = reduce(lambda x,y: x|y, list(self.child.keys()))
+        other_keys = reduce(lambda x,y: x|y, list(other.child.keys()))
         self_keys = {x:reduce(lambda x,y: x|y,
-                                [v for k,v in self.child.items() if x in k])
+                                [v for k,v in list(self.child.items()) if x in k])
                        for x in self_keys}
         other_keys = {x:reduce(lambda x,y: x|y,
-                                 [v for k,v in other.child.items() if x in k])
+                                 [v for k,v in list(other.child.items()) if x in k])
                         for x in other_keys}
         if set(self_keys) == set(other_keys):
             comp_keys = list(set(self_keys) & set(other_keys))
@@ -961,13 +998,13 @@ class MuType(object):
         """Subtracts one MuType from another."""
         if self.level_ != other.level_:
             raise HetmanDataError("mismatching MuType levels")
-        self_keys = reduce(lambda x,y: x|y, self.child.keys())
-        other_keys = reduce(lambda x,y: x|y, other.child.keys())
+        self_keys = reduce(lambda x,y: x|y, list(self.child.keys()))
+        other_keys = reduce(lambda x,y: x|y, list(other.child.keys()))
         self_keys = {x:reduce(lambda x,y: x|y,
-                                [v for k,v in self.child.items() if x in k])
+                                [v for k,v in list(self.child.items()) if x in k])
                        for x in self_keys}
         other_keys = {x:reduce(lambda x,y: x|y,
-                                 [v for k,v in other.child.items() if x in k])
+                                 [v for k,v in list(other.child.items()) if x in k])
                         for x in other_keys}
         new_key = {}
         for k in self_keys:
@@ -987,8 +1024,8 @@ class MuType(object):
         """MuType hashes are defined in an analagous fashion to those of
            tuples, see for instance http://effbot.org/zone/python-hash.htm"""
         value = 0x163125
-        for k,v in self.child.items():
-            value += (eval(hex((long(value) * 1000007) & 0xFFFFFFFFL)[:-1])
+        for k,v in list(self.child.items()):
+            value += (eval(hex((int(value) * 1000007) & '0xFFFFFFFFL')[:-1])
                       ^ hash(k) ^ hash(v))
             value ^= len(self.child)
         if value == -1:
@@ -1011,8 +1048,8 @@ class MuType(object):
             The list of samples that have the specified type of mutations.
         """
         samps = set()
-        for k,v in mtree.child.items():
-            for l,w in self.child.items():
+        for k,v in list(mtree.child.items()):
+            for l,w in list(self.child.items()):
                 if k in l:
                     if isinstance(v, frozenset):
                         samps |= v
@@ -1045,7 +1082,7 @@ class MuType(object):
         """Gets all of the possible subsets of this MuType that contain
            exactly one of the leaf properties."""
         mkeys = []
-        for k,v in self.child.items():
+        for k,v in list(self.child.items()):
             if v is None:
                 mkeys += [{(self.level_, i):None} for i in k]
             else:
@@ -1068,8 +1105,8 @@ class MuType(object):
             new_set = self
         else:
             new_key = {}
-            for k,v in mtree.child.items():
-                for l,w in self.child.items():
+            for k,v in list(mtree.child.items()):
+                for l,w in list(self.child.items()):
                     if k in l:
                         if w is not None:
                             new_key.update([((mtree.cur_level,k),
@@ -1116,11 +1153,8 @@ class MuType(object):
         """
         orig_size = len(self.get_samples(mtree))
         min_samps = max(int(round(orig_size * min_prop)), min_size)
-        prune_sets = filter(
-            lambda x: min_samps <= len(x.get_samples(mtree)) < orig_size,
-            [MutSet('AND NOT', self, MuType(m))
-             for m in self.invert(mtree).subkeys()]
-            )
+        prune_sets = [x for x in [MutSet('AND NOT', self, MuType(m))
+             for m in self.invert(mtree).subkeys()] if min_samps <= len(x.get_samples(mtree)) < orig_size]
         sub_groups = [MuType(m) for m in self.subkeys()]
         sub_list = [mtree.direct_subsets(m) for m in sub_groups]
         for i in range(len(sub_list)):
@@ -1162,11 +1196,10 @@ class MuType(object):
         prune_count = 1000 + len(prune_sets)
         while prune_count > max_part:
             use_sets = []
-            for csizes in product(*[range(1, len(x)+1) for x in sub_list]):
+            for csizes in product(*[list(range(1, len(x)+1)) for x in sub_list]):
                 for set_combn in product(
                     *[combn(sl, csize) for sl,csize in zip(sub_list,csizes)]):
-                    set_comps = map(lambda x: reduce(lambda y,z: y|z, x),
-                                    set_combn)
+                    set_comps = [reduce(lambda y,z: y|z, x) for x in set_combn]
                     new_set = reduce(lambda x,y: x|y, set_comps)
                     new_set = new_set.rationalize(mtree)
                     if new_set not in psets:
@@ -1207,7 +1240,7 @@ class MutExpr(object):
         A logged-into instance of the synapseclient.Synapse() class.
 
     project : str
-        An ICGC/TCGA project, i.e. BRCA-US or LGG-US
+        An ICGC/TCGA project, i.e. 'BRCA-US' or 'LGG-US'.
 
     mut_genes : list of strs
         A list of genes whose mutations we want to consider,
@@ -1252,7 +1285,7 @@ class MutExpr(object):
 
     def __init__(self, syn,
                  project, mut_genes, cv_info=None,
-                 mut_levels = ('Gene', 'Conseq', 'Exon'), load_cnv=False):
+                 mut_levels=('Gene', 'Conseq', 'Exon'), load_cnv=False):
 
         # loads gene expression and annotation data, mutation data
         self.project_ = project
@@ -1266,15 +1299,16 @@ class MutExpr(object):
         expr = expr.loc[:, expr.apply(
             lambda x: np.mean(x) > 0 and np.var(x) > 0,
             axis=0)]
-        annot = {g:a for g,a in annot.items()
+        annot = {g:a for g,a in list(annot.items())
                  if a['gene_name'] in expr.columns}
-        annot_genes = [a['gene_name'] for g,a in annot.items()]
+        annot_genes = [a['gene_name'] for g,a in list(annot.items())]
         expr = expr.loc[:, annot_genes]
+        expr = expr.loc[:,~expr.columns.duplicated()]
         annot_data = {mut_g:{'ID':g, 'Chr':a['chr'],
                              'Start':a['Start'], 'End':a['End']}
-                      for g,a in annot.items() for mut_g in mut_genes
+                      for g,a in list(annot.items()) for mut_g in mut_genes
                       if a['gene_name'] == mut_g}
-        annot_ids = {k:v['ID'] for k,v in annot_data.items()}
+        annot_ids = {k:v['ID'] for k,v in list(annot_data.items())}
         self.annot = annot
         samples = frozenset(set(muts['Sample']) & set(expr.index))
 
@@ -1327,7 +1361,7 @@ class MutExpr(object):
                 '/copy_number_somatic_mutation.tsv.gz'
                 )
             cnv_stats = {}
-            for g,an in annot_data.items():
+            for g,an in list(annot_data.items()):
                 gene_cnv = cnv_data[cnv_data['Chr'] == re.sub('chr','',
                                                               an['Chr'])]
                 gene_cnv = gene_cnv[gene_cnv['Start'] <= an['Start']]
@@ -1343,7 +1377,7 @@ class MutExpr(object):
         """Adds CNV loss inferred using a Gaussian mixture model
            to the mutation tree.
         """
-        for gene in self.cnv_.keys():
+        for gene in list(self.cnv_.keys()):
             cnv_def = defunct.Defunct(self, gene)
             loss_samps = cnv_def.get_loss()
             self.train_mut_.add_cnvs(cnv_def.mut_gene_,
@@ -1447,7 +1481,7 @@ class MutExpr(object):
 
         if hasattr(self, 'cnv_'):
             cnv = {g:{s:self.cnv_[g][s] for s in samples}
-                   for g in self.cnv_.keys()}
+                   for g in list(self.cnv_.keys())}
         else:
             cnv = None
         return cnv
@@ -1455,7 +1489,7 @@ class MutExpr(object):
     def test_classif_cv(self,
                         classif, mtype=None,
                         gene_list=None, exclude_samps=None,
-                        test_indx=range(20), tune_indx=None,
+                        test_indx=list(range(20)), tune_indx=None,
                         final_fit=False, verbose=False):
         """Test a classifier using tuning and cross-validation
            within the training samples of this dataset.
@@ -1508,18 +1542,19 @@ class MutExpr(object):
             train_cv = [(np.array(list(set(tr) & use_indx)),
                          np.array(list(set(tst) & use_indx)))
                          for tr,tst in train_cv]
+
         test_cvs = [x for i,x in enumerate(train_cv)
                     if i in test_indx]
         if tune_indx is not None:
             tune_cvs = [x for i,x in enumerate(train_cv)
                         if i in tune_indx]
             classif.tune(expr=train_expr, mut=train_mut,
-                         cv_samples=tune_cvs, test_count='auto',
-                         verbose=verbose)
+                         cv_samples=tune_cvs, verbose=verbose)
 
+        print((classif.named_steps['fit']))
         perf = np.percentile(model_selection.cross_val_score(
             estimator=classif, X=train_expr, y=train_mut,
-            scoring=_score_auc, cv=test_cvs, n_jobs=-1
+            scoring=_score_auc, cv=test_cvs, n_jobs=16, pre_dispatch=None
             ), 25)
         if final_fit:
             if exclude_samps is not None:
@@ -1529,7 +1564,7 @@ class MutExpr(object):
             classif.fit(X=train_expr, y=train_mut)
         return perf
 
-    def test_classif_full(self, classif, tune_indx=range(5), mtype=None):
+    def test_classif_full(self, classif, tune_indx=list(range(5)), mtype=None):
         """Test a classifier using by tuning within the training samples,
            training on all of them, and then testing on the testing samples.
 
