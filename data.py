@@ -12,7 +12,6 @@ import numpy as np
 import pandas as pd
 import re
 import defunct
-import synapseclient
 
 from enum import Enum
 from itertools import combinations as combn
@@ -103,7 +102,7 @@ def _read_expr(expr_file):
     -------
     expr : ndarray, shape (n_samples, n_features)
         An expression matrix with genes as features, in the case of
-        duplicate gene names values are averaged.
+        duplicate gene names, values are averaged.
     """
     expr = pd.read_csv(
         expr_file, usecols=(4,7,8), header=0, sep = '\t',
@@ -537,7 +536,7 @@ class MuTree(object):
         Parameters
         ----------
         mtype : MuType
-            A set of mutations whose direct descandants are to be obtained.
+            A set of mutations whose direct descendants are to be obtained.
 
         branches : set of strs, optional
             A set of branches whose subsets are to be obtained, the default is
