@@ -1,5 +1,5 @@
 language: python
 python:
-        - "2.7"
-script: pytest -q test_hetman.py
+        - "3.5"
+script: pytest -vv test_hetman.py
 

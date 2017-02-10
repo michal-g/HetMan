@@ -30,13 +30,8 @@ _data_dir = _base_dir + 'input-data/ICGC/raw/'
 _cv_dir = _base_dir + 'auxiliary/HetMan/cv-samples/'
 
 
-# .. mutation data types for use with MC3 TCGA data ..
-_mc3_levels = {
-    'Gene':((np.str_, 16), 0),
-    'Conseq':((np.str_, 32), 8),
-    'Exon':((np.str_, 8), 38),
-    'Protein':((np.str_, 16), 36)
-    }
+# .. supported mutation levels ..
+MutLevel = Enum('MutLevel', 'Gene Form PolyPhen Exon Protein')
 
 
 # .. helper functions for reading in genomic data from files downloaded
@@ -65,28 +60,28 @@ def _read_annot(version='v19'):
         sep = '\t', header=None, comment='#'
         )
 
-    annot_dt = np.dtype([('Chr','a64'), ('Type','a64'),
-                         ('Start','i4'), ('End','i4'), ('Annot','a2048')])
     # filter out annotation records that aren't
     # protein-coding genes on non-sex chromosomes
     chroms_use = ['chr' + str(i+1) for i in range(22)]
     annot = annot.loc[annot['Type'] == 'gene', ]
     chr_indx = np.array([chrom in chroms_use for chrom in annot['Chr']])
     annot = annot.loc[chr_indx, ]
+
+    # parse the info field to get each gene's annotation data
     gn_annot = {
         re.sub('\.[0-9]+', '', z['gene_id']).replace('"', ''):z
-        for z in [dict([['chr', an['Chr']]] +
-                       [['Start', an['Start']]] +
-                       [['End', an['End']]] +
+        for z in [dict([['chr', an[0]]] +
+                       [['Start', an[2]]] +
+                       [['End', an[3]]] +
                        [y for y in [x.split(' ')
-                                    for x in an['Info'].split('; ')]
+                                    for x in an[4].split('; ')]
                         if len(y) == 2])
-                  for an in annot]
+                  for an in annot.values]
         if z['gene_type'] == '"protein_coding"'
         }
-
     for g in gn_annot:
         gn_annot[g]['gene_name'] = gn_annot[g]['gene_name'].replace('"', '')
+
     return gn_annot
 
 
@@ -119,7 +114,7 @@ def _read_expr(expr_file):
                             values='FPKM', aggfunc=np.mean)
 
 
-def _read_mut(syn, mut_levels=('Gene','Conseq','Exon')):
+def _read_mut(syn, mut_levels=('Gene', 'Form', 'Exon')):
     """Reads ICGC mutation data from the MC3 synapse file.
 
     Parameters
@@ -137,23 +132,34 @@ def _read_mut(syn, mut_levels=('Gene','Conseq','Exon')):
         A mutation array, with a row for each mutation appearing in an
         individual sample.
     """
+    mut_cols = {
+        MutLevel.Gene: 0,
+        MutLevel.Form: 8,
+        MutLevel.PolyPhen: 72,
+        MutLevel.Exon: 38,
+        MutLevel.Protein: 36
+        }
+
+    # gets data from Synapse, figures out which columns to use
     mc3 = syn.get('syn7824274')
-    data_names = ['Sample', 'SIFT', 'PolyPhen'] + list(mut_levels)
-    use_cols = [15,71,72]
+    data_names = ['Sample'] + list(mut_levels)
+    use_cols = [15]
     for lvl in mut_levels:
-        use_cols += [_mc3_levels[lvl][1]]
+        use_cols.append(mut_cols[MutLevel[lvl]])
+    data_names = np.array(data_names)[np.array(use_cols).argsort()]
+
+    # imports data into a DataFrame, parses TCGA sample barcodes
+    # and PolyPhen scores
     muts = pd.read_csv(
         mc3.path, usecols=use_cols, sep='\t', header=None,
         names=data_names, comment='#', skiprows=1)
     muts['Sample'] = [reduce(lambda x,y: x+'-'+y,
                              s.split('-', 3)[:3])
                       for s in muts['Sample']]
-    muts['SIFT'] = [re.sub('\)$', '', re.sub('^.*\(', '', x))
-                    if x != '.' else 0
-                    for x in muts['SIFT']]
-    muts['PolyPhen'] = [re.sub('\)$', '', re.sub('^.*\(', '', x))
-                        if x != '.' else 0
-                        for x in muts['PolyPhen']]
+    if 'PolyPhen' in mut_levels:
+        muts['PolyPhen'] = [re.sub('\)$', '', re.sub('^.*\(', '', x))
+                            if x != '.' else 0
+                            for x in muts['PolyPhen']]
     return muts
 
 
@@ -211,15 +217,9 @@ class HetmanDataError(Exception):
     pass
 
 
-class MutLevel(Enum):
-    """A class corresponding to the various levels of mutation properties
-       supported by HetMan.
-    """
-    Gene = 1
-    Form = 2
-    Severity = 3
-    Exon = 4
-    Protein = 5
+
+    def __init__(self):
+        pass
 
 
 class MuTree(object):
@@ -262,123 +262,87 @@ class MuTree(object):
         The branches at this level of the hierarchy, i.e. the set of genes, set
         of possible consequences, etc.
     """
+    # .. functions for parsing various levels of mutation properties
+    def _muts_gene(muts):
+        return muts
+    
+    def _muts_form(muts):
+        muts.loc[:,'Form'] = muts.loc[:,'Form'].str.replace('_(Del|Ins)$', '')
+        return muts
+
+    def _muts_polyphen(muts):
+        mshift = MeanShift()
+        mshift.fit(
+            new_muts['Missense_Mutation']['PolyPhen'].reshape(-1,1))
+        muts.loc[:,'PolyPhen'] = ['MM_PolyPhen_' + str(round(x,2))
+                                  for x in mshift.cluster_centers_]
+        return muts
+
+    def _muts_exon(muts):
+        return muts
+
+    def _muts_protein(muts):
+        return muts
+
+    mut_fxs = {
+        MutLevel.Gene: _muts_gene,
+        MutLevel.Form: _muts_form,
+        MutLevel.PolyPhen: _muts_polyphen,
+        MutLevel.Exon: _muts_exon,
+        MutLevel.Protein: _muts_protein
+        }
 
     def __init__(self,
-                 muts, levels=('Gene', 'Conseq', 'Exon'),
-                 samples=None, genes=None):
-        if isinstance(levels[0], str):
-            self.levels = ((),levels)
-        else:
-            self.levels = levels
-        self.cur_level = self.levels[1][0]
-        if samples is None:
-            samples = set(muts['Sample'])
+                 muts, levels=('Gene', 'Form', 'Protein'),
+                 samples=None, genes=None, depth=0):
+        self.levels = [MutLevel[lvl] for lvl in levels]
+        self.depth = depth
+        self.cur_level = MutLevel[levels[depth]]
         if genes is None:
             genes = set(muts['Gene'])
-
-        # handles the possible mutation hierarchy levels
-        null_arr = np.empty(shape=0, dtype=muts.dtype)
-        if self.cur_level == 'Gene':
-            self.branches_ = genes
-            new_muts = {g:muts[muts['Gene'] == g] for g in genes}
-            new_samps = {g:(samples & set(new_muts[g]['Sample']))
-                         for g in genes}
-
-        elif self.cur_level == 'Conseq':
-            new_muts = {}
-            new_samps = {}
-            self.branches_ = set()
-            for s in samples:
-                mut_s = muts[muts['Sample'] == s]
-                conseqs = set(mut_s['Conseq'])
-                for c in conseqs:
-                    mut_c = mut_s[mut_s['Conseq'] == c]
-                    c_lab = re.sub('_(Del|Ins)', '', c)
-                    self.branches_ |= set([c_lab])
-                    add_samp = new_samps.get(c_lab, set()) | set([s])
-                    new_samps.update({c_lab:add_samp})
-                    add_mut = np.concatenate(
-                        (new_muts.get(c_lab, null_arr), mut_c))
-                    new_muts.update({c_lab:add_mut})
-            if 'Missense_Mutation' in new_muts:
-                mshift = MeanShift()
-                mshift.fit(
-                    new_muts['Missense_Mutation']['PolyPhen'].reshape(-1,1))
-                sev_labs = ['MM_PolyPhen_' + str(round(x,2))
-                            for x in mshift.cluster_centers_]
-                for i in range(len(sev_labs)):
-                    new_muts.update({
-                        sev_labs[i]:
-                        new_muts['Missense_Mutation'][mshift.labels_ == i, ]
-                        })
-                    new_samps.update({
-                        sev_labs[i]:
-                        set(new_muts['Missense_Mutation']['Sample']
-                            [mshift.labels_ == i, ])})
-                del new_muts['Missense_Mutation']
-                del new_samps['Missense_Mutation']
-
-        elif self.cur_level == 'Exon':
-            new_samps = {}
-            new_muts = {}
-            self.branches_ = set()
-            for s in samples:
-                mut_s = muts[muts['Sample'] == s]
-                exons = set(mut_s['Exon'])
-                self.branches_ |= exons
-                for ex in exons:
-                    mut_ex = mut_s[mut_s['Exon'] == ex]
-                    add_samp = new_samps.get(ex, set()) | set([s])
-                    new_samps.update({ex:add_samp})
-                    add_mut = np.concatenate((new_muts.get(ex, null_arr),
-                                              mut_ex))
-                    new_muts.update({ex:add_mut})
-
-        elif self.cur_level == 'Protein':
-            new_samps = {}
-            new_muts = {}
-            self.branches_ = set()
-            for s in samples:
-                mut_s = muts[muts['Sample'] == s]
-                proteins = set(mut_s['Protein'])
-                self.branches_ |= proteins
-                for p in proteins:
-                    mut_p = mut_s[mut_s['Protein'] == p]
-                    add_samp = new_samps.get(p, set()) | set([s])
-                    new_samps.update({p:add_samp})
-                    add_mut = np.concatenate((new_muts.get(p, null_arr),
-                                              mut_p))
-                    new_muts.update({p:add_mut})
-
-        # unless we have reached the final level, recurse down
-        # to the next level
-        if len(self.levels[1]) > 1:
-            self.child = {g:MuTree(
-                muts=new_muts[g],
-                samples=(samples & set(new_samps[g])), genes=genes,
-                levels=(self.levels[0] + (self.cur_level,),
-                        self.levels[1][1:])
-                ) for g in list(new_muts.keys())}
         else:
-            self.child = {g:frozenset(tuple(new_samps[g]))
-                          for g in list(new_muts.keys())}
+            gene_indx = [g in genes for g in muts['Gene']]
+            muts = muts.ix[gene_indx, ]
+
+        if samples is None:
+            samples = set(muts['Sample'])
+        else:
+            samples = set(muts['Sample']) & set(samples)
+            samp_indx = [s in samples for s in muts['Sample']]
+            muts = muts.ix[samp_indx, ]
+
+        muts = MuTree.mut_fxs[self.cur_level](muts)
+        mut_grouped = muts.groupby(self.cur_level.name)
+        new_muts = {}
+        for nm, grp in mut_grouped:
+            new_muts[nm] = grp
+            
+        if depth < (len(levels)-1):
+            self.child = {k:MuTree(
+                muts=v, levels=levels, samples=samples,
+                genes=None, depth=depth+1
+                ) for k,v in new_muts.items()}
+        else:
+            self.child = {k:frozenset(tuple(v['Sample']))
+                          for k,v in new_muts.items()}
+
 
     def __str__(self):
         """Printing a MuTree shows each of the branches of the tree and
            the samples at the end of each branch."""
-        new_str = self.cur_level
+        new_str = self.cur_level.name
         for k,v in list(self.child.items()):
             new_str = new_str + ' IS ' + k
             if isinstance(v, MuTree):
                 new_str = (new_str + ' AND '
-                           + '\n' + '\t'*(len(self.levels[0])+1) + str(v))
+                           + '\n' + '\t'*(self.depth+1) + str(v))
             else:
                 if len(v) > 15:
                     new_str = new_str + ': (' + str(len(v)) + ' samples)'
                 else:
                     new_str = (new_str + ': '
                                + reduce(lambda x,y: x + ',' + y, tuple(v)))
-            new_str = new_str + '\n' + '\t'*len(self.levels[0])
+            new_str = new_str + '\n' + '\t'*self.depth
         new_str = re.sub('\n$', '', new_str)
         return new_str
 
@@ -477,14 +441,22 @@ class MuTree(object):
             a MuType object (see below).
         """
         if levels is None:
-            levels = self.levels[1]
-        return {
-            (self.cur_level, k):(v.allkey(levels)
-                                 if (isinstance(v, MuTree)
-                                     and self.cur_level != levels[-1])
-                                 else None)
-            for k,v in list(self.child.items())
-            }
+            levels = [lvl.name for lvl in self.levels]
+        if not levels:
+            new_key = None
+        elif self.cur_level.name in levels:
+            cur_indx = levels.index(self.cur_level.name)
+            new_lvls = levels[:cur_indx] + levels[(cur_indx+1):]
+            new_key = {(self.cur_level, k):
+                       v.allkey(new_lvls) if isinstance(v, MuTree)
+                       else None
+                       for k,v in list(self.child.items())}
+        else:
+            new_key = reduce(lambda x,y: {**x,**y},
+                             [v.allkey(levels) if isinstance(v, MuTree)
+                              else {k:None}
+                              for k,v in list(self.child.items())])
+        return new_key
 
     def subsets(self, mtype=None, levels=None):
         """Gets all of the MuTypes corresponding to exactly one of the
@@ -1284,7 +1256,7 @@ class MutExpr(object):
 
     def __init__(self, syn,
                  project, mut_genes, cv_info=None,
-                 mut_levels=('Gene', 'Conseq', 'Exon'), load_cnv=False):
+                 mut_levels=('Gene', 'Form', 'Protein'), load_cnv=False):
 
         # loads gene expression and annotation data, mutation data
         self.project_ = project
