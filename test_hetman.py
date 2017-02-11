@@ -3,11 +3,13 @@
 
 import pytest
 import numpy as np
+import pandas as pd
 import pickle
 import sys
 
 sys.path += ['/home/users/grzadkow/compbio/scripts/HetMan']
 import data
+from itertools import combinations as combn
 
 
 @pytest.fixture(scope='module')
@@ -16,14 +18,37 @@ def muts_small():
         muts = pickle.load(fl)
     return muts
 
-
 @pytest.fixture(scope='module')
 def mtree_small(muts_small):
     return data.MuTree(muts_small, levels=('Gene','Form','Exon'))
 
+@pytest.fixture(scope='module')
+def mtypes_small():
+    mtype1 = data.MuType({('Gene', 'TTN'): None})
+    mtype2 = data.MuType(
+            {('Gene', 'TTN'):
+             {('Form', 'Missense_Mutation'):
+              {('Exon', ('326/363','10/363')): None}}}
+            )
+    mtype3 = data.MuType(
+            {('Gene', 'CDH1'): None,
+             ('Gene', 'TTN'):
+             {('Form', 'Missense_Mutation'):
+              {('Exon', ('302/363','10/363')): None}}}
+            )
+    mtype4 = data.MuType({('Form', 'Silent'): None})
+    mtype5 = data.MuType({('Gene', ('CDH1','TTN')): None})
+    return [mtype1, mtype2, mtype3, mtype4, mtype5]
 
-class TestBasicMuTreeCase:
+
+class TestCaseBasicMuTree:
     """Basic tests for Hetman MuTrees."""
+
+    def test_structure(self, muts_small, mtree_small):
+        """Is the internal structure of the tree correct?"""
+        assert set(list(mtree_small.child.keys())) == set(muts_small['Gene'])
+        assert (set(list(mtree_small.child['TTN'].child.keys()))
+                == set(muts_small['Form'][muts_small['Gene'] == 'TTN']))
 
     def test_samps(self, muts_small, mtree_small):
         """Does the tree properly store its samples?"""
@@ -32,11 +57,13 @@ class TestBasicMuTreeCase:
                 {k:list(muts_small.drop_duplicates()['Sample']).count(k)
                  for k in muts_small['Sample']})
 
-    def test_structure(self, muts_small, mtree_small):
-        """Is the internal structure of the tree correct?"""
-        assert set(list(mtree_small.child.keys())) == set(muts_small['Gene'])
-        assert (set(list(mtree_small.child['TTN'].child.keys()))
-                == set(muts_small['Form'][muts_small['Gene'] == 'TTN']))
+    def test_status(self, muts_small, mtree_small):
+        """Does the tree give the right mutation status?"""
+        samps1 = (["dummy" + str(i) for i in range(3)]
+                  + list(muts_small['Sample'])
+                  + ["dummy" + str(i) for i in range(11,16)])
+        assert (mtree_small.status(samps1)
+                == pd.Series(samps1).isin(muts_small['Sample'])).all()
 
     def test_print(self, mtree_small):
         """Can we print the tree?"""
@@ -86,46 +113,75 @@ class TestBasicMuTreeCase:
                          (data.MutLevel.Exon, '46/363'): None}}
 
 
-class TesBasicMuTypeCase:
+class TestCaseBasicMuType:
     """Basic tests for Hetman MuTypes."""
 
-    def test_samps(self, muts_small, mtree_small):
+    def test_samps(self, muts_small, mtree_small, mtypes_small):
         """Can we retrieve the right samples using a MuType?"""
-        mtype1 = data.MuType({('Gene', 'TP53'):None})
-        mtype2 = data.MuType(
-            {('Gene', 'TP53'):{('Conseq', 'Splice_Site'):None}})
-        mtype3 = data.MuType(
-            {('Gene', 'TP53'):
-             {('Conseq', 'Missense_Mutation'):{('Exon', '5/11'):None}}})
-        assert mtype1.get_samples(self.mtree) == set(self.muts['Sample'])
-        assert (
-            mtype2.get_samples(self.mtree) ==
-            set(self.muts['Sample'][self.muts['Conseq'] == 'Splice_Site']))
-        assert (
-            mtype3.get_samples(self.mtree) ==
-            set(self.muts['Sample'][np.array(
-                [x['Conseq'] == 'Missense_Mutation'
-                 and x['Exon'] == '5/11' for x in self.muts])])
-            )
+        assert (mtypes_small[4].get_samples(mtree_small)
+                == set(muts_small['Sample']))
+        assert (mtypes_small[0].get_samples(mtree_small)
+                == set(muts_small['Sample'][muts_small['Gene'] == 'TTN']))
+        assert (mtypes_small[3].get_samples(mtree_small)
+                == set(muts_small['Sample'][muts_small['Form'] == 'Silent']))
+        samp_indx = ((muts_small['Gene'] == 'TTN')
+                     & (muts_small['Form'] == 'Missense_Mutation')
+                     & (muts_small['Exon'].isin(['326/363','10/363'])))
+        assert (mtypes_small[1].get_samples(mtree_small)
+                == set(muts_small['Sample'][samp_indx]))
+        samp_indx = ((muts_small['Gene'] == 'CDH1')
+                     | ((muts_small['Gene'] == 'TTN')
+                        & (muts_small['Form'] == 'Missense_Mutation')
+                        & (muts_small['Exon'].isin(['302/363','10/363']))))
+        assert (mtypes_small[2].get_samples(mtree_small)
+                == set(muts_small['Sample'][samp_indx]))
+
+    def test_print(self, mtypes_small):
+        """Can we print MuTypes?"""
+        for mtype in mtypes_small:
+            print(mtype)
+
+    def test_hash(self, mtypes_small):
+        """Can we get the hash values of MuTypes?"""
+        hash_test = [hash(mtype) for mtype in mtypes_small]
+        assert len(set(hash_test)) == len(mtypes_small)
 
 
-class MuTypeBinaryTestCase:
+class TestCaseMuTypeBinary:
     """Tests the binary operators defined for MuTypes."""
 
-    def setUp(self):
-        self.mtype1 = data.MuType({('Gene', 'TP53'):None})
-        self.mtype2 = data.MuType(
-            {('Gene', 'TP53'):{('Conseq', 'Missense_Mutation'):None}})
-        self.mtype3 = data.MuType(
-            {('Gene', 'TP53'):
-             {('Conseq', ('Nonsense_Mutation','Missense_Mutation')):
-              {('Exon', '5/11'):None}}}
-            )
+    def test_eq(self, mtypes_small):
+        """Can we evaluate the equality of two MuTypes?"""
+        for mtype in mtypes_small:
+            assert mtype == mtype
+        for pair in combn(mtypes_small, 2):
+            assert pair[0] != pair[1]
 
-    def test_or(self):
-        for mtype in [self.mtype1,self.mtype2,self.mtype3]:
+    def test_and(self, mtypes_small):
+        """Can we take the intersection of two MuTypes?"""
+        for mtype in mtypes_small:
+            assert mtype == (mtype & mtype)
+        assert (mtypes_small[0] & mtypes_small[1]) == mtypes_small[1]
+        assert (mtypes_small[0] & mtypes_small[4]) == mtypes_small[0]
+        assert ((mtypes_small[1] & mtypes_small[2])
+                == data.MuType(
+                    {('Gene', 'TTN'):
+                     {('Form', 'Missense_Mutation'):
+                      {('Exon', '10/363'): None}}})
+                    )
+
+    def test_or(self, mtypes_small):
+        """Can we take the union of two MuTypes?"""
+        for mtype in mtypes_small:
             assert mtype == (mtype | mtype)
-        assert self.mtype1 | self.mtype2 == self.mtype1
-        assert self.mtype1 | self.mtype3 == self.mtype1
+        assert (mtypes_small[0] | mtypes_small[1]) == mtypes_small[0]
+        assert (mtypes_small[0] | mtypes_small[4]) == mtypes_small[4]
+        assert ((mtypes_small[1] | mtypes_small[2])
+                == data.MuType(
+                    {('Gene', 'CDH1'): None,
+                     ('Gene', 'TTN'):
+                     {('Form', 'Missense_Mutation'):
+                      {('Exon', ('326/363', '302/363', '10/363')): None}}})
+                    )
 
 

@@ -808,7 +808,11 @@ class MuType(object):
         if len(level) > 1:
             raise HetmanDataError(
                 "improperly defined MuType key (multiple mutation levels)")
-        self.level_ = tuple(level)[0]
+        level = tuple(level)[0]
+        if isinstance(level, MutLevel):
+            self.level_ = level
+        else:
+            self.level_ = MutLevel[level]
 
         # gets the subsets of mutations defined at this level, and
         # their further subdivisions if they exist
@@ -832,7 +836,7 @@ class MuType(object):
         if isinstance(self, MuType) ^ isinstance(other, MuType):
             eq = False
         elif self.level_ != other.level_:
-            raise HetmanDataError("can't compare MuTypes of different levels")
+            eq = False
         else:
             eq = (self.child == other.child)
         return eq
@@ -841,10 +845,10 @@ class MuType(object):
         """Printing a MuType shows the hierarchy of mutation
            properties contained within it."""
         new_str = ''
-        if self.level_ == 'Gene':
+        if self.level_ == MutLevel.Gene:
             new_str += 'a mutation where '
         for k,v in list(self.child.items()):
-            new_str += (self.level_ + ' IS '
+            new_str += (self.level_.name + ' IS '
                         + reduce(lambda x,y: x + ' OR ' + y, k))
             if v is not None:
                 new_str += ' AND ' + '\n\t' + str(v)
@@ -862,55 +866,63 @@ class MuType(object):
         """Returns the union of two MuTypes."""
         if not isinstance(other, MuType):
             return NotImplemented
-        if self.level_ != other.level_:
-            raise HetmanDataError("can't join MuTypes of different levels")
-        new_key = {}
-        self_set = set(self.child.keys()) - set(other.child.keys())
-        other_set = set(other.child.keys()) - set(self.child.keys())
-        both_set = set(self.child.keys()) & set(other.child.keys())
+        if self.level_ is not other.level_:
+            if self.level_.value < other.level_.value:
+                return self
+            else:
+                return other
+        else:
+            new_key = {}
+            self_set = set(self.child.keys()) - set(other.child.keys())
+            other_set = set(other.child.keys()) - set(self.child.keys())
+            both_set = set(self.child.keys()) & set(other.child.keys())
 
-        if self_set:
-            new_key.update({(self.level_, k):self.child[k]
-                            for k in self_set})
-        if other_set:
-            new_key.update({(other.level_, k):other.child[k]
-                            for k in other_set})
-        if both_set:
-            new_key.update(dict(
-                tuple((tuple((self.level_, k)), self.child[k]))
-                if self.child[k] == other.child[k]
-                else tuple((tuple((self.level_, k)), None))
-                if self.child[k] is None or other.child[k] is None
-                else tuple((tuple((self.level_, k)),
-                            self.child[k] | other.child[k]))
-                for k in both_set))
+            if self_set:
+                new_key.update({(self.level_, k):self.child[k]
+                                for k in self_set})
+            if other_set:
+                new_key.update({(other.level_, k):other.child[k]
+                                for k in other_set})
+            if both_set:
+                new_key.update(dict(
+                    tuple((tuple((self.level_, k)), self.child[k]))
+                    if self.child[k] == other.child[k]
+                    else tuple((tuple((self.level_, k)), None))
+                    if self.child[k] is None or other.child[k] is None
+                    else tuple((tuple((self.level_, k)),
+                                self.child[k] | other.child[k]))
+                    for k in both_set))
         return MuType(new_key)
 
     def __and__(self, other):
+        """Finds the intersection of two MuTypes."""
         if not isinstance(other, MuType):
             return NotImplemented
-        """Finds the intersection of two MuTypes."""
-        if self.level_ != other.level_:
-            raise HetmanDataError('mismatching MuType levels')
-        new_key = {}
-        self_keys = self._raw_key()
-        other_keys = other._raw_key()
-        both_set = list(set(self_keys) & set(other_keys))
-        for k in both_set:
-            if self_keys[k] is None:
-                new_key.update({(self.level_, k):other_keys[k]})
-            elif other_keys[k] is None:
-                new_key.update({(self.level_, k):self_keys[k]})
-            elif self_keys[k] == other_keys[k]:
-                new_key.update({(self.level_, k):self_keys[k]})
+        if self.level_ is not other.level_:
+            if self.level_.value > other.level_.value:
+                return self
             else:
-                intx = self_keys[k] & other_keys[k]
-                if intx is not None:
-                    new_key.update({(self.level_, k):intx})
-        if new_key:
-            return MuType(new_key)
+                return other
         else:
-            return None
+            new_key = {}
+            self_keys = self._raw_key()
+            other_keys = other._raw_key()
+            both_set = list(set(self_keys) & set(other_keys))
+            for k in both_set:
+                if self_keys[k] is None:
+                    new_key.update({(self.level_, k):other_keys[k]})
+                elif other_keys[k] is None:
+                    new_key.update({(self.level_, k):self_keys[k]})
+                elif self_keys[k] == other_keys[k]:
+                    new_key.update({(self.level_, k):self_keys[k]})
+                else:
+                    intx = self_keys[k] & other_keys[k]
+                    if intx is not None:
+                        new_key.update({(self.level_, k):intx})
+            if new_key:
+                return MuType(new_key)
+            else:
+                return None
 
     def __add__(self, other):
         if self == other:
@@ -996,8 +1008,8 @@ class MuType(object):
            tuples, see for instance http://effbot.org/zone/python-hash.htm"""
         value = 0x163125
         for k,v in list(self.child.items()):
-            value += (eval(hex((int(value) * 1000007) & '0xFFFFFFFFL')[:-1])
-                      ^ hash(k) ^ hash(v))
+            value += eval(hex((int(value) * 1000007) & 0xFFFFFFFF)[:-1])
+            value ^= hash(k) ^ hash(v)
             value ^= len(self.child)
         if value == -1:
             value = -2
@@ -1019,15 +1031,21 @@ class MuType(object):
             The list of samples that have the specified type of mutations.
         """
         samps = set()
-        for k,v in list(mtree.child.items()):
-            for l,w in list(self.child.items()):
-                if k in l:
-                    if isinstance(v, frozenset):
-                        samps |= v
-                    elif w is None:
-                        samps |= v.get_samples()
-                    else:
-                        samps |= w.get_samples(v)
+        if self.level_ in mtree.levels:
+            if self.level_ is not mtree.cur_level:
+                for v in mtree.child.values():
+                    if isinstance(v, MuTree):
+                        samps |= self.get_samples(v)
+            else:
+                for k,v in mtree.child.items():
+                    for l,w in self.child.items():
+                        if k in l:
+                            if isinstance(v, frozenset):
+                                samps |= v
+                            elif w is None:
+                                samps |= v.get_samples()
+                            else:
+                                samps |= w.get_samples(v)
         return samps
 
     def invert(self, mtree):
