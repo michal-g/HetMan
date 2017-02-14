@@ -8,7 +8,7 @@ import pickle
 import sys
 
 sys.path += ['/home/users/grzadkow/compbio/scripts/HetMan']
-import data
+import mutation
 from itertools import combinations as combn
 
 
@@ -20,24 +20,24 @@ def muts_small():
 
 @pytest.fixture(scope='module')
 def mtree_small(muts_small):
-    return data.MuTree(muts_small, levels=('Gene','Form','Exon'))
+    return mutation.MuTree(muts_small, levels=('Gene','Form','Exon'))
 
 @pytest.fixture(scope='module')
 def mtypes_small():
-    mtype1 = data.MuType({('Gene', 'TTN'): None})
-    mtype2 = data.MuType(
+    mtype1 = mutation.MuType({('Gene', 'TTN'): None})
+    mtype2 = mutation.MuType(
             {('Gene', 'TTN'):
              {('Form', 'Missense_Mutation'):
               {('Exon', ('326/363','10/363')): None}}}
             )
-    mtype3 = data.MuType(
+    mtype3 = mutation.MuType(
             {('Gene', 'CDH1'): None,
              ('Gene', 'TTN'):
              {('Form', 'Missense_Mutation'):
               {('Exon', ('302/363','10/363')): None}}}
             )
-    mtype4 = data.MuType({('Form', 'Silent'): None})
-    mtype5 = data.MuType({('Gene', ('CDH1','TTN')): None})
+    mtype4 = mutation.MuType({('Form', 'Silent'): None})
+    mtype5 = mutation.MuType({('Gene', ('CDH1','TTN')): None})
     return [mtype1, mtype2, mtype3, mtype4, mtype5]
 
 
@@ -57,12 +57,14 @@ class TestCaseBasicMuTree:
                 {k:list(muts_small.drop_duplicates()['Sample']).count(k)
                  for k in muts_small['Sample']})
 
-    def test_status(self, muts_small, mtree_small):
+    def test_status(self, muts_small, mtree_small, mtypes_small):
         """Does the tree give the right mutation status?"""
         samps1 = (["dummy" + str(i) for i in range(3)]
                   + list(muts_small['Sample'])
                   + ["dummy" + str(i) for i in range(11,16)])
         assert (mtree_small.status(samps1)
+                == pd.Series(samps1).isin(muts_small['Sample'])).all()
+        assert (mtree_small.status(samps1, mtypes_small[4])
                 == pd.Series(samps1).isin(muts_small['Sample'])).all()
 
     def test_print(self, mtree_small):
@@ -75,42 +77,42 @@ class TestCaseBasicMuTree:
         key2 = mtree_small.allkey(['Gene','Form'])
         key3 = mtree_small.allkey()
         key4 = mtree_small.allkey(['Gene','Exon'])
-        assert key1 == {(data.MutLevel.Gene, 'CDH1'): None,
-                        (data.MutLevel.Gene, 'TTN'): None}
-        assert key2 == {(data.MutLevel.Gene, 'CDH1'):
-                        {(data.MutLevel.Form, 'Silent'): None},
-                        (data.MutLevel.Gene, 'TTN'):
-                        {(data.MutLevel.Form, 'Missense_Mutation'): None,
-                         (data.MutLevel.Form, 'Silent'): None}}
-        assert key3 == {(data.MutLevel.Gene, 'CDH1'):
-                        {(data.MutLevel.Form, 'Silent'):
-                         {(data.MutLevel.Exon, '7/16'): None}},
-                        (data.MutLevel.Gene, 'TTN'):
-                        {(data.MutLevel.Form, 'Missense_Mutation'):
-                         {(data.MutLevel.Exon, '10/363'): None,
-                          (data.MutLevel.Exon, '133/363'): None,
-                          (data.MutLevel.Exon, '232/363'): None,
-                          (data.MutLevel.Exon, '256/363'): None,
-                          (data.MutLevel.Exon, '280/363'): None,
-                          (data.MutLevel.Exon, '284/363'): None,
-                          (data.MutLevel.Exon, '302/363'): None,
-                          (data.MutLevel.Exon, '326/363'): None,
-                          (data.MutLevel.Exon, '46/363'): None},
-                         (data.MutLevel.Form, 'Silent'):
-                         {(data.MutLevel.Exon, '26/363'): None}}}
-        assert key4 == {(data.MutLevel.Gene, 'CDH1'):
-                        {(data.MutLevel.Exon, '7/16'): None},
-                        (data.MutLevel.Gene, 'TTN'):
-                        {(data.MutLevel.Exon, '10/363'): None,
-                         (data.MutLevel.Exon, '133/363'): None,
-                         (data.MutLevel.Exon, '232/363'): None,
-                         (data.MutLevel.Exon, '256/363'): None,
-                         (data.MutLevel.Exon, '26/363'): None,
-                         (data.MutLevel.Exon, '280/363'): None,
-                         (data.MutLevel.Exon, '284/363'): None,
-                         (data.MutLevel.Exon, '302/363'): None,
-                         (data.MutLevel.Exon, '326/363'): None,
-                         (data.MutLevel.Exon, '46/363'): None}}
+        assert key1 == {(mutation.MutLevel.Gene, 'CDH1'): None,
+                        (mutation.MutLevel.Gene, 'TTN'): None}
+        assert key2 == {(mutation.MutLevel.Gene, 'CDH1'):
+                        {(mutation.MutLevel.Form, 'Silent'): None},
+                        (mutation.MutLevel.Gene, 'TTN'):
+                        {(mutation.MutLevel.Form, 'Missense_Mutation'): None,
+                         (mutation.MutLevel.Form, 'Silent'): None}}
+        assert key3 == {(mutation.MutLevel.Gene, 'CDH1'):
+                        {(mutation.MutLevel.Form, 'Silent'):
+                         {(mutation.MutLevel.Exon, '7/16'): None}},
+                        (mutation.MutLevel.Gene, 'TTN'):
+                        {(mutation.MutLevel.Form, 'Missense_Mutation'):
+                         {(mutation.MutLevel.Exon, '10/363'): None,
+                          (mutation.MutLevel.Exon, '133/363'): None,
+                          (mutation.MutLevel.Exon, '232/363'): None,
+                          (mutation.MutLevel.Exon, '256/363'): None,
+                          (mutation.MutLevel.Exon, '280/363'): None,
+                          (mutation.MutLevel.Exon, '284/363'): None,
+                          (mutation.MutLevel.Exon, '302/363'): None,
+                          (mutation.MutLevel.Exon, '326/363'): None,
+                          (mutation.MutLevel.Exon, '46/363'): None},
+                         (mutation.MutLevel.Form, 'Silent'):
+                         {(mutation.MutLevel.Exon, '26/363'): None}}}
+        assert key4 == {(mutation.MutLevel.Gene, 'CDH1'):
+                        {(mutation.MutLevel.Exon, '7/16'): None},
+                        (mutation.MutLevel.Gene, 'TTN'):
+                        {(mutation.MutLevel.Exon, '10/363'): None,
+                         (mutation.MutLevel.Exon, '133/363'): None,
+                         (mutation.MutLevel.Exon, '232/363'): None,
+                         (mutation.MutLevel.Exon, '256/363'): None,
+                         (mutation.MutLevel.Exon, '26/363'): None,
+                         (mutation.MutLevel.Exon, '280/363'): None,
+                         (mutation.MutLevel.Exon, '284/363'): None,
+                         (mutation.MutLevel.Exon, '302/363'): None,
+                         (mutation.MutLevel.Exon, '326/363'): None,
+                         (mutation.MutLevel.Exon, '46/363'): None}}
 
 
 class TestCaseBasicMuType:
@@ -164,7 +166,7 @@ class TestCaseMuTypeBinary:
         assert (mtypes_small[0] & mtypes_small[1]) == mtypes_small[1]
         assert (mtypes_small[0] & mtypes_small[4]) == mtypes_small[0]
         assert ((mtypes_small[1] & mtypes_small[2])
-                == data.MuType(
+                == mutation.MuType(
                     {('Gene', 'TTN'):
                      {('Form', 'Missense_Mutation'):
                       {('Exon', '10/363'): None}}})
@@ -177,7 +179,7 @@ class TestCaseMuTypeBinary:
         assert (mtypes_small[0] | mtypes_small[1]) == mtypes_small[0]
         assert (mtypes_small[0] | mtypes_small[4]) == mtypes_small[4]
         assert ((mtypes_small[1] | mtypes_small[2])
-                == data.MuType(
+                == mutation.MuType(
                     {('Gene', 'CDH1'): None,
                      ('Gene', 'TTN'):
                      {('Form', 'Missense_Mutation'):
