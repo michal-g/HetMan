@@ -14,8 +14,6 @@ import random
 import defunct
 import re
 
-from enum import Enum
-from itertools import groupby
 from sklearn import model_selection
 from classif import _score_auc
 from scipy.stats import fisher_exact
@@ -32,12 +30,14 @@ _firehose_dir = _base_dir + 'input-data/analyses__2016_01_28/'
 
 # .. helper functions for parsing -omic datasets ..
 def parse_tcga_barcodes(barcodes):
+    """Extracts the sample labels from TCGA barcodes."""
     return [reduce(lambda x,y: x + '-' + y,
                    s.split('-', 4)[:4])
             for s in barcodes]
 
 
 def log_norm_expr(expr):
+    """Log-normalizes expression data."""
     log_add = np.min(np.min(expr[expr > 0])) * 0.5
     return np.log2(expr + log_add)
 
@@ -56,7 +56,7 @@ def get_annot(version='v19'):
 
     Returns
     -------
-    gene_annot : dict
+    annot : dict
         Dictionary with keys corresponding to Ensembl gene IDs and values
         consisting of dicts with annotation fields.
     """
@@ -94,7 +94,6 @@ def get_annot(version='v19'):
 # .. functions for reading in mRNA expression datasets ..
 def get_expr_firehose(cohort):
     """Gets expression data as a matrix from a Firehose GDAC file."""
-
     expr_file = (
         _firehose_dir + cohort
         + '/gdac.broadinstitute.org_BRCA.Merge_rnaseqv2__illuminahiseq_'
@@ -103,6 +102,7 @@ def get_expr_firehose(cohort):
         )
     raw_data = pd.read_csv(expr_file, sep='\t', dtype=object)
 
+    # parses gene and sample names to get expression matrix axis labels
     gene_names = [re.sub('\|.*$', '', str(x)) for x in raw_data.ix[:,0]]
     gene_indx = [x not in ['gene_id','nan','?'] for x in gene_names]
     expr_data = raw_data.ix[gene_indx, 1:]
@@ -160,6 +160,7 @@ def get_mut_mc3(syn, mut_levels=('Gene', 'Form', 'Exon')):
         A mutation array, with a row for each mutation appearing in an
         individual sample.
     """
+    # columns in the MC3 file containing each level in the mutation hierarchy
     mut_cols = {
         MutLevel.Gene: 0,
         MutLevel.Form: 8,
@@ -186,6 +187,7 @@ def get_mut_mc3(syn, mut_levels=('Gene', 'Form', 'Exon')):
         muts['PolyPhen'] = [re.sub('\)$', '', re.sub('^.*\(', '', x))
                             if x != '.' else 0
                             for x in muts['PolyPhen']]
+
     return muts
 
 
@@ -240,15 +242,17 @@ def get_cnv_icgc(cnv_file):
 
 def get_cnv_gdac(cohort):
     """Gets CNV data as a matrix from a Firehose GDAC file."""
-
     cnv_file = (_firehose_dir + cohort
                 + '/GDAC_Gistic2Report_22529547_broad_data_by_genes.txt')
     raw_data = pd.read_csv(cnv_file, sep='\t')
+
+    # parses gene and sample names into CNV matrix axis labels
     gene_names = [re.sub('\|.*$', '', str(x))
-                  for x in pd.Series(raw_data.ix[1:,0])]
-    cnv_data = raw_data.ix[1:,3:]
+                  for x in pd.Series(raw_data.ix[1:, 0])]
+    cnv_data = raw_data.ix[1:, 3:]
     cnv_data.index = gene_names
     cnv_data.columns = parse_tcga_barcodes(cnv_data.columns)
+
     return cnv_data.T
 
 
@@ -263,29 +267,27 @@ class MutExpr(object):
         A logged-into instance of the synapseclient.Synapse() class.
 
     cohort : str
-        An ICGC/TCGA cohort, i.e. 'BRCA' or 'UCEC'.
+        An ICGC/TCGA cohort, i.e. 'BRCA' or 'UCEC' available for download
+        in Broad Firehose.
 
     mut_genes : list of strs
         A list of genes whose mutations we want to consider,
         i.e. ['TP53','KRAS'].
 
-    cv_info : dict, optional
-        A dictionary with a Label field (i.e. 'two-thirds')
-        and a Sample field (i.e. 45) which specifes which cross-validation
-        sample this object will use for training and testing expression-based
-        classifiers of mutation status.
-
     mut_levels : tuple, optional
         A list of mutation levels we want to consider, see
         MuTree and MuType above.
 
+    cv_info : {'Prop': float in (0,1), 'Seed': int}
+        A dictionary giving the proportion of samples to use for training
+        in cross-validation, and the seed to use for the random choice
+        of training samples.
+
     Attributes
     ----------
-    cohort_ : str
-        The ICGC cohort whose data is stored in this object.
-
-    cv_index_ : int
-        Which cross-validation sample this object uses.
+    intern_cv_ : int
+        Which seed to use for internal cross-validation sampling of the
+        training set.
 
     train_expr_ : array-like, shape=(n_samples,n_tr_features)
         The subset of expression data used for training of classifiers.
@@ -298,26 +300,25 @@ class MutExpr(object):
 
     test_mut_ : MuTree
         Hierarchy of mutations present in the testing samples.
-
-    cnv_ : dict
-        Mean CNV scores for genes whose mutations we want to consider.
     """
 
     def __init__(self,
                  syn, cohort, mut_genes,
                  mut_levels=('Gene', 'Form', 'Protein'),
                  cv_info={'Prop': 2.0/3, 'Seed':1}):
-
-        # loads gene expression and annotation data, mutation data
         self.cohort_ = cohort
+        self.intern_cv_ = cv_info['Seed'] ** 2
+        self.mut_genes = mut_genes
+
+        # loads gene expression and mutation data
         annot = get_annot()
         expr = get_expr_firehose(cohort)
-        muts = get_mut_mc3(syn, mut_levels)
+        muts = get_mut_mc3(syn, list(set(mut_levels) - set(['GISTIC'])))
         cnvs = get_cnv_gdac(cohort)
 
         # filters out genes that are not expressed in any samples, don't have
         # any variation across the samples, are not included in the
-        # annotation data, or are not in the mutation dataset
+        # annotation data, or are not in the mutation datasets
         expr = expr.loc[:, expr.apply(
             lambda x: np.mean(x) > 0 and np.var(x) > 0, axis=0)]
         annot = {g:a for g,a in annot.items()
@@ -327,10 +328,24 @@ class MutExpr(object):
         expr = expr.loc[:,~expr.columns.duplicated()]
         muts = muts.loc[muts['Sample'].isin(expr.index), :]
         muts = muts.loc[muts['Sample'].isin(cnvs.index), :]
+
+        # gets set of samples shared across expression and mutation datasets,
+        # subsets these datasets to use only these samples
         self.samples = set(muts['Sample']) & set(expr.index) & set(cnvs.index)
         expr = expr.loc[self.samples, :]
-        cnvs = cnvs.loc[self.samples, expr.columns]
+        cnvs = cnvs.loc[self.samples, mut_genes]
 
+        # merges simple somatic mutations with CNV calls
+        cnvs['Sample'] = cnvs.index
+        cnvs = pd.melt(cnvs, id_vars=['Sample'],
+                       value_name='GISTIC', var_name='Gene')
+        cnvs = cnvs.loc[cnvs['GISTIC'] != 0, :]
+        cnvs['Form'] = ['Gain' if x > 0 else 'Loss' for x in cnvs['GISTIC']]
+        muts = pd.concat(objs=(muts, cnvs), axis=0,
+                         join='outer', ignore_index=True)
+
+        # gets annotation data for the genes whose mutations
+        # are under consideration
         annot_data = {mut_g:{'ID':g, 'Chr':a['chr'],
                              'Start':a['Start'], 'End':a['End']}
                       for g,a in annot.items() for mut_g in mut_genes
@@ -338,9 +353,7 @@ class MutExpr(object):
         annot_ids = {k:v['ID'] for k,v in annot_data.items()}
         self.annot = annot
 
-        # if cross-validation info is specified, get list of samples used for
-        # training and testing after filtering out those for which we don't
-        # have expression and mutation data
+        # gets subset of samples to use for training
         random.seed(a=cv_info['Seed'])
         self.cv_seed = random.getstate()
         self.train_samps_ = frozenset(
@@ -348,12 +361,11 @@ class MutExpr(object):
                           k=int(round(len(self.samples) * cv_info['Prop'])))
             )
 
+        # creates training and testing expression and mutation datasets
         self.train_expr_ = log_norm_expr(
             expr.loc[self.train_samps_, :])
         self.test_expr_ = log_norm_expr(
             expr.loc[self.samples - self.train_samps_, :])
-        self.train_cnv_ = cnvs.loc[self.train_samps_, mut_genes]
-        self.test_cnv_ = cnvs.loc[self.samples - self.train_samps_, mut_genes]
         self.train_mut_ = MuTree(
             muts=muts, samples=self.train_samps_,
             genes=mut_genes, levels=mut_levels
@@ -362,20 +374,6 @@ class MutExpr(object):
             muts=muts, samples=(self.samples - self.train_samps_),
             genes=mut_genes, levels=mut_levels
             )
-        self.intern_cv = cv_info['Seed'] ** 2
-
-
-    def add_cnv_loss(self):
-        """Adds CNV loss inferred using a Gaussian mixture model
-           to the mutation tree.
-        """
-        for gene in list(self.cnv_.keys()):
-            cnv_def = defunct.Defunct(self, gene)
-            loss_samps = cnv_def.get_loss()
-            self.train_mut_.add_cnvs(cnv_def.mut_gene_,
-                                     {'Loss': loss_samps[0]})
-            self.test_mut_.add_cnvs(cnv_def.mut_gene_,
-                                    {'Loss': loss_samps[1]})
 
     def mutex_test(self, mtype1, mtype2):
         """Checks the mutual exclusivity of two mutation types in the
@@ -391,8 +389,8 @@ class MutExpr(object):
         pval : float
             The p-value given by the test.
         """
-        samps1 = self.train_mut_.get_samples(mtype1)
-        samps2 = self.train_mut_.get_samples(mtype2)
+        samps1 = mtype1.get_samples(self.train_mut_)
+        samps2 = mtype2.get_samples(self.train_mut_)
         if not samps1 or not samps2:
             raise HetmanDataError("Both sets must be non-empty!")
         all_samps = set(self.train_expr_.index)
@@ -437,7 +435,7 @@ class MutExpr(object):
                 [(x,y) for x,y
                  in model_selection.StratifiedShuffleSplit(
                      n_splits = 100, test_size = 0.2,
-                     random_state=self.cv_index_
+                     random_state=self.intern_cv_
                  ).split(self.train_expr_, mut_status)])
 
     def testing(self, mtype=None, gene_list=None):
@@ -467,16 +465,6 @@ class MutExpr(object):
         mut_status = self.test_mut_.status(self.test_expr_.index, mtype)
         return (self.test_expr_.loc[:,gene_list],
                 mut_status)
-
-    def get_cnv(self, samples=None):
-        """Gets the CNV data for the given samples if it is available."""
-
-        if hasattr(self, 'cnv_'):
-            cnv = {g:{s:self.cnv_[g][s] for s in samples}
-                   for g in list(self.cnv_.keys())}
-        else:
-            cnv = None
-        return cnv
 
     def test_classif_cv(self,
                         classif, mtype=None,
@@ -556,7 +544,8 @@ class MutExpr(object):
             classif.fit(X=train_expr, y=train_mut)
         return perf
 
-    def test_classif_full(self, classif, tune_indx=list(range(5)), mtype=None):
+    def test_classif_full(self,
+                          classif, mtype=None, tune_indx=list(range(5))):
         """Test a classifier using by tuning within the training samples,
            training on all of them, and then testing on the testing samples.
 

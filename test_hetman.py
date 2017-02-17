@@ -1,6 +1,4 @@
 
-
-
 import pytest
 import numpy as np
 import pandas as pd
@@ -114,6 +112,12 @@ class TestCaseBasicMuTree:
                          (mutation.MutLevel.Exon, '326/363'): None,
                          (mutation.MutLevel.Exon, '46/363'): None}}
 
+    def test_subsets(self, mtree_small, mtypes_small):
+        """Can we get the subsets of a MuType with a MuTree?"""
+        assert len(mtree_small.subsets()) == 11
+        assert len(mtree_small.subsets(mtypes_small[0])) == 10
+        assert len(mtree_small.subsets(mtypes_small[1])) == 2
+
 
 class TestCaseBasicMuType:
     """Basic tests for Hetman MuTypes."""
@@ -144,9 +148,11 @@ class TestCaseBasicMuType:
             print(mtype)
 
     def test_hash(self, mtypes_small):
-        """Can we get the hash values of MuTypes?"""
+        """Can we get proper hash values of MuTypes?"""
         hash_test = [hash(mtype) for mtype in mtypes_small]
+        hash_test2 = [hash(mtype) for mtype in mtypes_small]
         assert len(set(hash_test)) == len(mtypes_small)
+        assert all([x == y for x,y in zip(hash_test, hash_test2)])
 
 
 class TestCaseMuTypeBinary:

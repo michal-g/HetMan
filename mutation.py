@@ -6,17 +6,18 @@ This file contains classes for representing mutation subtypes in
 formats that facilitate classification of mutation sub-types.
 """
 
+import pandas as pd
 import re
 from enum import Enum
 from itertools import combinations as combn
 from itertools import groupby, product
-from math import log, ceil
+from math import log, ceil, exp
 from sklearn.cluster import MeanShift
 from functools import reduce
 
 
 # .. supported mutation levels ..
-MutLevel = Enum('MutLevel', 'Gene Form PolyPhen Exon Protein')
+MutLevel = Enum('MutLevel', 'Gene Form PolyPhen GISTIC Exon Protein')
 
 
 class MuTree(object):
@@ -68,11 +69,19 @@ class MuTree(object):
         return muts
 
     def _muts_polyphen(muts):
-        mshift = MeanShift()
-        mshift.fit(
-            new_muts['Missense_Mutation']['PolyPhen'].reshape(-1,1))
-        muts.loc[:,'PolyPhen'] = ['MM_PolyPhen_' + str(round(x,2))
-                                  for x in mshift.cluster_centers_]
+        mshift = MeanShift(bandwidth=exp(-3))
+        mshift.fit(pd.DataFrame(muts['PolyPhen']))
+        clust_vec = ['PolyPhen_' + str(round(mshift.cluster_centers_[x,0], 2))
+                     for x in mshift.labels_]
+        muts['PolyPhen'] = clust_vec
+        return muts
+
+    def _muts_gistic(muts):
+        mshift = MeanShift(bandwidth=exp(-2))
+        mshift.fit(pd.DataFrame(muts['GISTIC']))
+        clust_vec = ['GISTIC_' + str(round(mshift.cluster_centers_[x,0], 2))
+                     for x in mshift.labels_]
+        muts['GISTIC'] = clust_vec
         return muts
 
     def _muts_exon(muts):
@@ -85,6 +94,7 @@ class MuTree(object):
         MutLevel.Gene: _muts_gene,
         MutLevel.Form: _muts_form,
         MutLevel.PolyPhen: _muts_polyphen,
+        MutLevel.GISTIC: _muts_gistic,
         MutLevel.Exon: _muts_exon,
         MutLevel.Protein: _muts_protein
         }
@@ -95,6 +105,7 @@ class MuTree(object):
         self.levels = [MutLevel[lvl] for lvl in levels]
         self.depth = depth
         self.cur_level = MutLevel[levels[depth]]
+
         if genes is None:
             genes = set(muts['Gene'])
         else:
@@ -109,32 +120,34 @@ class MuTree(object):
             muts = muts.ix[samp_indx, ]
 
         muts = MuTree.mut_fxs[self.cur_level](muts)
-        mut_grouped = muts.groupby(self.cur_level.name)
-        new_muts = {}
-        for nm, grp in mut_grouped:
-            new_muts[nm] = grp
-            
-        if depth < (len(levels)-1):
-            self.child = {k:MuTree(
-                muts=v, levels=levels, samples=samples,
-                genes=None, depth=depth+1
-                ) for k,v in new_muts.items()}
-        else:
-            self.child = {k:frozenset(tuple(v['Sample']))
-                          for k,v in new_muts.items()}
-
+        self.child = {}
+        for nm,mut in muts.groupby(self.cur_level.name):
+            next_level = None
+            if depth < (len(levels) - 1):
+                for lvl in levels[(depth + 1):]:
+                    if not all([x|y for x,y in
+                                zip(mut[lvl].isin(['.']),
+                                    mut[lvl].isnull())]):
+                        next_level = lvl
+                        break
+            if next_level is None:
+                self.child[nm] = frozenset(mut['Sample'])
+            else:
+                self.child[nm] = MuTree(
+                    muts=mut, levels=levels, samples=samples,
+                    genes=None, depth=levels.index(next_level))
 
     def __str__(self):
         """Printing a MuTree shows each of the branches of the tree and
            the samples at the end of each branch."""
         new_str = self.cur_level.name
-        for k,v in list(self.child.items()):
+        for k,v in self.child.items():
             new_str = new_str + ' IS ' + k
             if isinstance(v, MuTree):
                 new_str = (new_str + ' AND '
                            + '\n' + '\t'*(self.depth+1) + str(v))
             else:
-                if len(v) > 15:
+                if len(v) > 10:
                     new_str = new_str + ': (' + str(len(v)) + ' samples)'
                 else:
                     new_str = (new_str + ': '
@@ -193,43 +206,18 @@ class MuTree(object):
             ov = 0
         return ov
 
-    def add_cnvs(self, mut_gene, cnvs):
-        """Adds a list of copy number variations for the given gene to the
-           mutation hierarchy. CNVs are treated as Gain/Loss entries on the
-           Consequence level.
-
-        Parameters
-        ----------
-        mut_gene : str
-            One of the genes in the mutation tree. An error will be raised
-            otherwise.
-
-        cnvs : dict
-            A dictionary with "Gain" and/or "Loss" as keys and individual
-            samples as values.
-        """
-        if self.cur_level.name != 'Gene':
-            raise HetmanDataError("CNVs can only be added to the "
-                                  "<Gene> level of a mutation tree.")
-        if not mut_gene in list(self.child.keys()):
-            raise HetmanDataError("CNVs can only be added to a gene "
-                                  "already in the tree.")
-        for k,v in list(cnvs.items()):
-            if v:
-                self.child[mut_gene].child['Loss'] = frozenset(v)
-
     def allkey(self, levels=None):
         """Gets the key corresponding to the MuType that contains all of the
-           branches of the tree. A convenience function that makes it easier to
-           list all of the possible branches present in the tree, and to
+           branches of the tree. A convenience function that makes it easier
+           to list all of the possible branches present in the tree, and to
            instantiate MuType objects that correspond to all of the possible
            mutation types.
 
         Parameters
         ----------
         levels : tuple
-            A list of levels corresponding to how far the output MuType should
-            recurse.
+            A list of levels corresponding to how far the output MuType
+            should recurse.
 
         Returns
         -------
@@ -247,12 +235,12 @@ class MuTree(object):
             new_key = {(self.cur_level, k):
                        v.allkey(new_lvls) if isinstance(v, MuTree)
                        else None
-                       for k,v in list(self.child.items())}
+                       for k,v in self.child.items()}
         else:
             new_key = reduce(lambda x,y: {**x,**y},
                              [v.allkey(levels) if isinstance(v, MuTree)
                               else {k:None}
-                              for k,v in list(self.child.items())])
+                              for k,v in self.child.items()])
         return new_key
 
     def subsets(self, mtype=None, levels=None):
@@ -277,25 +265,23 @@ class MuTree(object):
         if mtype is None:
             mtype = MuType(self.allkey(levels))
         if levels is None:
-            levels = self.levels[1]
-        mtypes = []
-        if self.cur_level != levels[-1]:
-            for k,v in list(self.child.items()):
-                for l,w in list(mtype.child.items()):
+            levels = [lvl.name for lvl in self.levels]
+        if self.cur_level.name in levels:
+            mtypes = []
+            for k,v in self.child.items():
+                for l,w in mtype.child.items():
                     if k in l:
-                        if isinstance(v, MuTree):
+                        new_lvls = list(
+                            set(levels) - set([self.cur_level.name]))
+                        if isinstance(v, MuTree) and len(new_lvls) > 0:
                             mtypes += [MuType({(self.cur_level, k):s})
-                                      for s in v.subsets(w, levels)]
+                                       for s in v.subsets(w, new_lvls)]
                         else:
-                            mtypes += [MuType({(self.cur_level, k):None})
-                                      for k in (set(self.child.keys())
-                                                & reduce(lambda x,y: x|y,
-                                                         list(mtype.child.keys())))]
+                            mtypes += [MuType({(self.cur_level, k):None})]
         else:
-            mtypes += [MuType({(self.cur_level, k):None})
-                      for k in (set(self.child.keys())
-                                & reduce(lambda x,y: x|y,
-                                         list(mtype.child.keys())))]
+            mtypes += [v.subsets(mtype, levels)
+                       for k,v in self.child.items()
+                       if isinstance(v, MuTree)]
         return mtypes
 
     def direct_subsets(self, mtype, branches=None):
