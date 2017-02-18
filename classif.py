@@ -4,98 +4,47 @@ Hetman (Heterogeneity Manifold)
 Classification of mutation sub-types using expression data.
 This file contains the algorithms used as building blocks for the
 classification ensembles of mutation sub-types.
-
-Ported into python from the original Matlab code written by Mehmet Gonen and
-available at https://github.com/mehmetgonen/kbtl and described in further
-detail in http://www.aaai.org/ocs/index.php/AAAI/AAAI14/paper/view/8132.
 """
 
 # Author: Michal Grzadkowski <grzadkow@ohsu.edu>
 
-from sklearn.feature_selection.base import SelectorMixin
-from sklearn.feature_selection import GenericUnivariateSelect
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import GridSearchCV
-from sklearn.cluster import KMeans
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import roc_auc_score
+from data import read_sif, get_graph
+from itertools import chain
+from math import log, exp
+import re
+import dill as pickle
+from functools import reduce
 
 import numpy as np
-import re
-from itertools import groupby
-from math import log,exp
 from scipy import stats
-import dill as pickle
+import dirichlet
+from bioservices.pathwaycommons import PathwayCommons as PC
+from bioservices.services import REST, BioServicesError
 
-_base_dir = '/home/users/grzadkow/compbio/'
+from sklearn.feature_selection.base import SelectorMixin
+from sklearn.svm.base import BaseSVC
+from sklearn.feature_selection import GenericUnivariateSelect
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import (
+    StandardScaler, PolynomialFeatures, RobustScaler)
+from sklearn.model_selection import (
+    RandomizedSearchCV, StratifiedShuffleSplit)
+from sklearn.metrics import roc_auc_score
+from sklearn.metrics.pairwise import (
+    rbf_kernel, check_pairwise_arrays, pairwise_distances)
+from sklearn.random_projection import GaussianRandomProjection
+from sklearn.decomposition import PCA
+
+from sklearn.naive_bayes import GaussianNB
+from sklearn.linear_model import LogisticRegression, SGDClassifier
+from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.gaussian_process import GaussianProcessClassifier
+from sklearn.cluster import KMeans
 
 
 # .. helper functions for classification and feature selection classes ..
-def _score_auc(estimator, expr, mut):
-    """Computes the AUC score for a mutation classifier on a given
-       expression matrix and a mutation state vector.
-
-    Parameters
-    ----------
-    estimator : UniClassifier
-        A mutation classification algorithm as defined below.
-
-    expr : array-like, shape (n_samples,n_features)
-        An expression dataset.
-
-    mut : array-like, shape (n_samples,)
-        A boolean vector corresponding to the presence of a particular type of
-        mutation in the same set of samples as the given expression dataset.
-
-    Returns
-    -------
-    S : float
-        The AUC score corresponding to mutation classification accuracy.
-    """
-    mut_scores = estimator.prob_mut(expr)
-    return roc_auc_score(mut, mut_scores)
-
-
-def _read_sif(mut_genes, sif_file='input-data/babur-mutex/data-tcga/Network.sif'):
-    """Gets the edges containing at least one of given genes from a SIF
-       pathway file and arranges them according to the direction of the
-       edge and the type of interaction it represents.
-
-    Parameters
-    ----------
-    mut_genes : array-like, shape (n_genes,)
-        A list of genes whose interactions are to be retrieved.
-
-    sif_file : str, optional
-        A file in SIF format describing gene interactions.
-        The default is the set of interactions used in the MutEx paper.
-
-    Returns
-    -------
-    link_data : dict
-        A list of the interactions that involve one of the given genes.
-    """
-    sif_dt = np.dtype(
-        [('Gene1', np.str_, 16),
-         ('Type', np.str_, 32),
-         ('Gene2', np.str_, 16)])
-    sif_data = np.loadtxt(
-        fname = _base_dir + sif_file, dtype = sif_dt, delimiter = '\t')
-    link_data = {g:{'in':None, 'out':None} for g in mut_genes}
-
-    for gene in mut_genes:
-        in_data = np.sort(sif_data[sif_data['Gene2'] == gene],
-                          order='Type')
-        out_data = np.sort(sif_data[sif_data['Gene1'] == gene],
-                           order='Type')
-        link_data[gene]['in'] = {k:[x['Gene1'] for x in v] for k,v in
-                                 groupby(in_data, lambda x: x['Type'])}
-        link_data[gene]['out'] = {k:[x['Gene2'] for x in v] for k,v in
-                                  groupby(out_data, lambda x: x['Type'])}
-    return link_data
-
-
 def _mut_ttest(expr_vec, mut):
     """Performs the Student's t-test on the hypothesis that the given
        expression values differ according to the given mutation status.
@@ -190,20 +139,18 @@ class GeneSelect(GenericUnivariateSelect):
                  mut_genes, expr_genes):
         self.mut_genes = mut_genes
         self.expr_genes = expr_genes
-        self.link_data = _read_sif(mut_genes)
+        self.link_data = read_sif(mut_genes)
         link_genes = set()
-        for gene,directs in self.link_data.items():
-            for direction,int_types in directs.items():
-                for int_type,genes in int_types.items():
+        for gene,directs in list(self.link_data.items()):
+            for direction,int_types in list(directs.items()):
+                for int_type,genes in list(int_types.items()):
                     link_genes |= set(genes)
         self.link_genes = tuple(link_genes & set(self.expr_genes))
         self.link_indx = {g:self.expr_genes.index(g)
                           for g in self.link_genes}
-        self.params = {'path_prior':path_prior, 'path_dir':path_dir}
-        skl.feature_selection.GenericUnivariateSelect.__init__(self,
-            score_func=self._score_genes,
-            mode='k_best',
-            param=30
+        self._tune_params = {'path_prior':path_prior, 'path_dir':path_dir}
+        GenericUnivariateSelect.__init__(self,
+            score_func=self._score_genes, mode='k_best', param=30
             )
 
     def _score_genes(self, X, y):
@@ -213,11 +160,11 @@ class GeneSelect(GenericUnivariateSelect):
         """
         gene_scores = np.apply_along_axis(
             func1d=lambda x: _mut_ttest(x, y),
-            axis=0, arr=X[:,self.link_indx.values()]
+            axis=0, arr=X[:,list(self.link_indx.values())]
             )
-        for gene,directs in self.link_data.items():
-            for direction,int_types in directs.items():
-                for int_type,genes in int_types.items():
+        for gene,directs in list(self.link_data.items()):
+            for direction,int_types in list(directs.items()):
+                for int_type,genes in list(int_types.items()):
                     for g in list(set(genes) & set(self.link_genes)):
                         g_indx = self.link_genes.index(g)
                         gene_scores[g_indx] *= self.params['path_prior']
@@ -234,23 +181,442 @@ class GeneSelect(GenericUnivariateSelect):
 
 
 class PathwaySelect(SelectorMixin):
+    """Chooses gene features based on their presence
+       in Pathway Commons pathways.
+    """
 
-    def __init__(self, path_key, expr_genes):
-        self.path_key = path_key
-        self.expr_genes = expr_genes
-        self.mut_genes = list(set([g for g,_,_ in path_key]))
+    def __init__(self, path_obj):
+        self.path_obj = path_obj
         SelectorMixin.__init__(self)
 
-    def fit(self, X):
-        path_obj = _read_sif(self.mut_genes)
-        self.path_genes = reduce(
-            lambda x,y: set(x) | set(y),
-            [path_obj[g][d][t] for g,d,t in self.path_key]
-            )
+    def fit(self, X, y, **fit_params):
+        self.expr_genes = X.columns
+        self.path_genes = list(set(
+            chain(*chain(
+                *[list(x.values()) for x in list(self.path_obj.values())]
+            ))))
         return self
 
     def _get_support_mask(self):
         return np.array([g in self.path_genes for g in self.expr_genes])
+
+    def get_params(self, deep=True):
+        return {'path_obj':self.path_obj}
+
+
+class UniClassifier(Pipeline):
+    """A class corresponding to expression-based classifiers of mutation
+       status that use a single expr-mut dataset.
+    """
+
+    def __init__(self, steps):
+        Pipeline.__init__(self, steps)
+
+    def __str__(self):
+        param_list = self.get_params()
+        return reduce(
+            lambda x,y: x + ', ' + y,
+            [k + ': ' + str(param_list[k])
+             for k in list(self._tune_priors.keys())]
+            )
+
+    def prob_mut(self, expr):
+        mut_scores = self.predict_proba(expr)
+        if hasattr(self, 'classes_'):
+            true_indx = [i for i,x in enumerate(self.classes_) if x]
+        else:
+            wghts = tuple(self.named_steps['fit'].weights_)
+            true_indx = wghts.index(min(wghts))
+        return [m[true_indx] for m in mut_scores]
+
+    @classmethod
+    def score_auc(cls, estimator, expr, mut):
+        """Computes the AUC score for a mutation classifier on a given
+        expression matrix and a mutation state vector.
+
+        Parameters
+        ----------
+        expr : array-like, shape (n_samples,n_features)
+            An expression dataset.
+
+        mut : array-like, shape (n_samples,)
+            A boolean vector corresponding to the presence of a particular
+            type of mutation in the same set of samples as the given
+            expression dataset.
+
+        Returns
+        -------
+        S : float
+            The AUC score corresponding to mutation classification accuracy.
+        """
+        mut_scores = estimator.prob_mut(expr)
+        return roc_auc_score(mut, mut_scores)
+
+    def tune(self, expr, mut, cv_samples, test_count=16, verbose=False):
+        """Tunes the hyper-parameters of the classifier."""
+        if self._tune_priors:
+            grid_test = RandomizedSearchCV(
+                estimator=self, param_distributions=self._tune_priors,
+                n_iter=test_count, scoring=self.score_auc, cv=cv_samples,
+                n_jobs=-1, refit=False
+                )
+            grid_test.fit(expr, mut)
+            tune_scores = (grid_test.cv_results_['mean_test_score']
+                           - grid_test.cv_results_['std_test_score'])
+            self.set_params(
+                **grid_test.cv_results_['params'][tune_scores.argmax()])
+            #for param in self._tune_priors.keys():
+            #    new_mean,new_sd = _update_params(
+            #        [(x[param],y)
+            #            for x,y in zip(
+            #               grid_test.cv_results_['params'],
+            #               grid_test.cv_results_['mean_test_score'])
+            #            ])
+            #    self._param_priors[param] = stats.lognorm(
+            #        scale=new_mean, s=new_sd)
+            if verbose:
+                print(self)
+
+    def get_coef(self):
+        """Gets the coefficients of the classifier."""
+        return self.named_steps['fit'].coefs_
+
+# .. classifiers that don't use any prior information ..
+class NaiveBayes(UniClassifier):
+    """A class corresponding to Gaussian Naive Bayesian classification
+       of mutation status.
+    """
+
+    def __init__(self, mut_genes=None, expr_genes=None):
+        self._tune_priors = {}
+        norm_step = StandardScaler()
+        fit_step = GaussianNB()
+        UniClassifier.__init__(self,
+            [('norm', norm_step), ('fit', fit_step)])
+
+
+class Lasso(UniClassifier):
+    """A class corresponding to logistic regression classification
+       of mutation status with the lasso regularization penalty.
+    """
+
+    def __init__(self, mut_genes=None, expr_genes=None):
+        self._tune_priors = {
+            'fit__C':stats.lognorm(scale=exp(-1), s=exp(1))}
+        norm_step = StandardScaler()
+        fit_step = LogisticRegression(
+            penalty='l1', tol=1e-2, class_weight='balanced')
+        UniClassifier.__init__(self,
+            [('norm', norm_step), ('fit', fit_step)])
+
+
+class LogReg(UniClassifier):
+    """A class corresponding to logistic regression classification
+       of mutation status with the elastic net regularization penalty.
+    """
+
+    def __init__(self, mut_genes=None, expr_genes=None):
+        self._tune_priors = {
+            'fit__alpha':stats.lognorm(scale=exp(1), s=exp(1)),
+            'fit__l1_ratio':[0,0.25,0.5,0.75,1.0]}
+        norm_step = StandardScaler()
+        fit_step = SGDClassifier(
+            loss='log', penalty='elasticnet',
+            n_iter=100, class_weight='balanced')
+        UniClassifier.__init__(self,
+            [('norm', norm_step), ('fit', fit_step)])
+
+
+class SVCrbf(UniClassifier):
+    """A class corresponding to C-support vector classification
+       of mutation status with a radial basis kernel.
+    """
+   
+    def __init__(self, mut_genes=None, expr_genes=None):
+        self._tune_priors = {
+            'fit__C':stats.lognorm(scale=exp(-1), s=exp(1)),
+            'fit__gamma':stats.lognorm(scale=1e-5, s=exp(2))}
+        norm_step = StandardScaler()
+        fit_step = SVC(
+            kernel='rbf', probability=True, class_weight='balanced')
+        UniClassifier.__init__(self,
+            [('norm', norm_step), ('fit', fit_step)])
+
+
+class rForest(UniClassifier):
+    """A class corresponding to random forest classification
+       of mutation status.
+    """
+
+    def __init__(self, mut_genes=None, expr_genes=None):
+        self._tune_priors = {
+            'fit__max_features':[0.01,0.02,0.05,0.1,0.2],
+            'fit__min_samples_leaf':[0.0001,0.02,0.04,0.06]}
+        norm_step = StandardScaler()
+        fit_step = RandomForestClassifier(
+                    n_estimators=1000, class_weight='balanced')
+        UniClassifier.__init__(self,
+            [('norm', norm_step), ('fit', fit_step)])
+
+
+class KNeigh(UniClassifier):
+    """A class corresponding to k-nearest neighbours voting classification
+       of mutation status.
+    """
+
+    def __init__(self, mut_genes=None, expr_genes=None):
+        self._tune_priors = {'fit__n_neighbors':[40,80,120,160,200,240,300]}
+        norm_step = StandardScaler()
+        fit_step = KNeighborsClassifier(
+            weights='distance', algorithm='ball_tree', leaf_size=20)
+        UniClassifier.__init__(self,
+            [('norm', norm_step), ('fit', fit_step)])
+
+
+class RBFgbc(UniClassifier):
+    """A class corresponding to gaussian process classification
+       of mutation status with a radial basis kernel.
+    """
+
+    def __init__(self, mut_genes=None, expr_genes=None):
+        self._tune_priors = {}
+        norm_step = StandardScaler()
+        fit_step = GaussianProcessClassifier()
+        UniClassifier.__init__(self,
+            [('norm', norm_step), ('fit', fit_step)])
+
+
+class NewTest(UniClassifier):
+    """A class for testing miscellaneous new classification pipelines."""
+
+    def __init__(self, mut_genes=None):
+        self._tune_priors = {
+            'proj__eps':[0.2,0.5,0.8],
+            'fit__C':stats.lognorm(scale=exp(1), s=exp(1))}
+        proj_step = GaussianRandomProjection()
+        feat_step = PolynomialFeatures(2)
+        fit_step = LogisticRegression(penalty='l1', tol=2e-2)
+        UniClassifier.__init__(self,
+            [('proj', proj_step), ('feat', feat_step), ('fit', fit_step)])
+
+
+# .. classifiers that use Pathway Commons as prior information ..
+class PCsvc(SVC):
+    """A kernel based on Pathway Commons neighbours."""
+
+    def _pc_kernel(self, X, Y=None):
+        norm_val = self.PCdir + self.PCtype
+        if Y is not None:
+            expr_out_kern = rbf_kernel(
+                X[:,self.expr_out_indx], Y[:,self.expr_out_indx],
+                gamma=self.gamma)
+            expr_in_kern = rbf_kernel(
+                X[:,self.expr_in_indx], Y[:,self.expr_in_indx],
+                gamma=self.gamma)
+            state_out_kern = rbf_kernel(
+                X[:,self.state_out_indx], Y[:,self.state_out_indx],
+                gamma=self.gamma)
+            state_in_kern = rbf_kernel(
+                X[:,self.state_in_indx], Y[:,self.state_in_indx],
+                gamma=self.gamma)
+        else:
+            expr_out_kern = rbf_kernel(
+                X[:,self.expr_out_indx], gamma=self.gamma)
+            expr_in_kern = rbf_kernel(
+                X[:,self.expr_in_indx], gamma=self.gamma)
+            state_out_kern = rbf_kernel(
+                X[:,self.state_out_indx], gamma=self.gamma)
+            state_in_kern = rbf_kernel(
+                X[:,self.state_in_indx], gamma=self.gamma)
+
+        return (
+            ((expr_out_kern * (self.PCdir * self.PCtype))
+             + (expr_in_kern * ((1 - self.PCdir) * self.PCtype))
+             + (state_out_kern * (self.PCdir * (1 - self.PCtype)))
+             + (state_in_kern * ((1 - self.PCdir) * (1 - self.PCtype)))
+            ) / norm_val)
+
+    def __init__(self, path_obj, PCdir=0.5, PCtype=0.5, C=1, gamma=1):
+        self.path_obj = path_obj
+        self.PCdir = PCdir
+        self.PCtype = PCtype
+        self.gamma = gamma
+        SVC.__init__(self, kernel=self._pc_kernel, gamma=gamma, C=C,
+                     probability=True, max_iter=1e4)
+
+
+class PCdir(BaseSVC):
+   
+    def _weight_eucl(self, x, y, weights=None):
+        if weights is None:
+            weights = [1.0 for i in x]
+        k = [w*((i-j)**2) for i,j,w in zip(x,y,weights)]
+        return sum(k)
+
+    def _dir_kern(self, X, Y=None, weights=None, gamma=None):
+        X,Y = check_pairwise_arrays(X,Y)
+        if gamma is None:
+            gamma = 2.0
+        K = pairwise_distances(
+            X, Y, metric=lambda x,y: self._weight_eucl(x,y,weights))
+        K *= -gamma
+        np.exp(K, K)
+        return K
+
+    def _lin_kern(self, X, Y=None, weights=None):
+        X,Y = check_pairwise_arrays(X,Y)
+        if weights is None:
+            weights = [1.0 for i in X.shape[1]]
+        return np.dot(weights * X, Y.T)
+
+    def _poly_kern(self, X, Y=None, weights=None):
+        X,Y = check_pairwise_arrays(X,Y)
+        if weights is None:
+            weights = [1.0 for i in X.shape[1]]
+        return (np.dot(weights * X, Y.T) + 1.0) ** 2.0
+
+    def _sigmoid_kern(self, X, Y=None, weights=None):
+        X,Y = check_pairwise_arrays(X,Y)
+        if weights is None:
+            weights = [1.0 for i in X.shape[1]]
+        return np.dot(X,Y.T)
+
+    def _cor_kern(self, X, Y=None, weights=None):
+        X,Y = check_pairwise_arrays(X,Y)
+        if weights is None:
+            weights = [1.0 for i in X.shape[1]]
+        M_x = np.dot(X, weights.T)
+        M_y = np.dot(Y, weights.T)
+        diff_x = (X.T - M_x).T
+        diff_y = (Y.T - M_y).T
+        S_x = np.dot(diff_x**2.0, weights.T)
+        S_y = np.dot(diff_y**2.0, weights.T)
+        S_xy = np.dot(weights * diff_x, diff_y.T)
+        return abs(S_xy / (np.outer(S_x,S_y)**0.5))
+
+    def _diss_kern(self, X, Y=None, weights=None):
+        X,Y = check_pairwise_arrays(X,Y)
+        if weights is None:
+            weights = [1.0 for i in X.shape[1]]
+        M_x = np.dot(X, weights.T)
+        M_y = np.dot(Y, weights.T)
+        diff_x = (X.T - M_x).T
+        diff_y = (Y.T - M_y).T
+        S_x = np.dot(diff_x**2.0, weights.T)
+        S_y = np.dot(diff_y**2.0, weights.T)
+        S_xy = np.dot(weights * diff_x, diff_y.T)
+        return (1.0 + (S_xy / (np.outer(S_x,S_y)**0.5))) / 2
+
+    def test_kern(self, X, y):
+        self.clf.fit(X, y)
+        pred_labs = np.sign(y - 0.5)
+        pred_distance = self.clf.decision_function(X)
+        self.dist += [np.mean(np.sign(pred_distance))]
+        return np.mean([dis*labs for dis,labs in zip(pred_distance,pred_labs)])
+
+    def dis_regr(self, X, y):
+        mut_vec = y - np.mean(y)
+        H_mat = np.outer(mut_vec * np.inner(mut_vec,mut_vec) ** -1.0,
+                         mut_vec)
+        norm_mat = np.eye(X.shape[0]) - np.ones([X.shape[0]]*2) / X.shape[0]
+        G_mat = np.dot(np.dot(norm_mat, X), norm_mat)
+        nH_mat = np.eye(X.shape[0]) - H_mat
+        return (np.trace(np.dot(np.dot(H_mat, G_mat), H_mat))
+                / np.trace(np.dot(np.dot(nH_mat, G_mat), nH_mat)))
+
+    def dist_metr(self, X, y):
+        same_dist = (np.mean(np.triu(X[np.ix_(y, y)], k=1))
+                     + np.mean(np.triu(X[np.ix_(~y, ~y)], k=1))) / 2.0
+        diff_dist = np.mean(X[np.ix_(y, ~y)])
+        return same_dist - diff_dist
+
+    def __init__(self, n_wghts=250):
+        self.clf = SVC(C=1.0, kernel='precomputed', probability=False,
+                       class_weight='balanced')
+        self.clf_prob = SVC(C=1.0, kernel='precomputed', probability=True,
+                           class_weight='balanced')
+        self.n_wghts = n_wghts
+        self.dist = []
+
+    def fit(self, X, y, **fit_params):
+        X = np.array(X)
+        y = np.array(y)
+        self.n_samp = int(round(X.shape[0] ** 0.5))
+        dir_params = [1.0 for x in range(X.shape[1])]
+        convergence = False
+        iter_count = 0
+        cur_score = float('-inf')
+        while not convergence and iter_count < 100:
+            new_wghts = np.random.dirichlet(
+                dir_params, size=self.n_wghts)
+            new_samps = [
+                x[0] for x in StratifiedShuffleSplit(
+                    n_splits=self.n_samp, train_size=X.shape[0]**-exp(-1)
+                    ).split(X,y)
+                ]
+            test_mat = np.zeros([len(new_wghts), len(new_samps)])
+            for s in range(len(new_samps)):
+                for w in range(len(new_wghts)):
+                    new_kern = self._lin_kern(
+                        X[new_samps[s],], weights=new_wghts[w])
+                    test_mat[w,s] = self.test_kern(
+                        new_kern, y[new_samps[s].tolist()])
+            prm_likeli = np.apply_along_axis(np.percentile, 1, test_mat, 25)
+            new_score = np.mean(prm_likeli)
+            if new_score < cur_score and iter_count > 30:
+                convergence = True
+            else:
+                cur_score = new_score
+                if (iter_count % 10) == 0:
+                    print(('Iter ' + str(iter_count) + ', perf: '
+                           + str(round(new_score, 4))))
+                prm_likeli = ((prm_likeli - min(prm_likeli))
+                          / (max(prm_likeli) - min(prm_likeli))) ** 2.0
+                prior_lglike = np.array([dirichlet.loglikelihood(
+                    np.array([new_wghts[i,:]]),
+                    np.array(dir_params))
+                    for i in range(new_wghts.shape[0])])
+                prior_lglike = ((prior_lglike - max(prior_lglike)) /
+                                (min(prior_lglike) - max(prior_lglike)))
+                if not any(np.isnan(prior_lglike)):
+                    prm_likeli = (prm_likeli ** 0.67) * (prior_lglike ** 0.33)
+                prm_likeli = prm_likeli / sum(prm_likeli)
+                prm_draw = np.random.choice(
+                    range(new_wghts.shape[0]),
+                    size=int(round(self.n_wghts**0.5)),
+                    replace=True, p=prm_likeli)
+                if (np.mean(np.apply_along_axis(np.var, 1, new_wghts[prm_draw,:]))
+                    < 1e-6):
+                    convergence = True
+                else:
+                    try:
+                        new_params = dirichlet.mle(
+                            new_wghts[prm_draw,:], tol=1e-3, maxiter=int(1e5))
+                        if (np.mean(abs(new_params - dir_params)) < 0.1
+                            or np.mean(new_params) > 20):
+                            convergence = True
+                        else:
+                            iter_count += 1
+                            dir_params = new_params
+                            print(np.round(np.mean(new_params), 3))
+                    except:
+                        convergence = True
+        self.feat_wghts = np.random.dirichlet(dir_params)
+        self.old_kern = self._lin_kern(X, weights=self.feat_wghts)
+        self.old_X = X
+        self.clf_prob.fit(self.old_kern, y)
+        self.classes_ = self.clf_prob.classes_
+        return self
+
+    def predict(self, X, **fit_params):
+        new_kern = self._lin_kern(
+            X=self.old_X, Y=X, weights=self.feat_wghts).T
+        return self.clf_prob.predict(new_kern)
+
+    def predict_proba(self, X, **fit_params):
+        new_kern = self._lin_kern(
+            X=self.old_X, Y=X, weights=self.feat_wghts).T
+        return self.clf_prob.predict_proba(new_kern)
 
 
 class PathwayCluster(Pipeline):
@@ -263,87 +629,64 @@ class PathwayCluster(Pipeline):
             [('feat', feat_step), ('norm', norm_step), ('fit', fit_step)])
 
 
-class UniClassifier(Pipeline):
-    """A class corresponding to expression-based"""
-    """classifiers of mutation status."""
+class PCsvm(UniClassifier):
+    """A class corresponding to SVM classification of mutation status using
+       a convex combination of kernels based on Pathway Commons.
+    """
 
-    def __init__(self, steps):
-        Pipeline.__init__(self, steps)
-
-    def __str__(self):
-        param_list = self.get_params()
-        return reduce(
-            lambda x,y: x + ', ' + y,
-            [k + ': ' + str(param_list[k])
-             for k in self._tune_params.keys()]
-            )
-
-    def prob_mut(self, expr):
-        mut_scores = self.predict_proba(expr)
-        if hasattr(self, 'classes_'):
-            true_indx = [i for i,x in enumerate(self.classes_) if x]
-        else:
-            wghts = tuple(self.named_steps['fit'].weights_)
-            true_indx = wghts.index(min(wghts))
-        return [m[true_indx] for m in mut_scores]
-
-    def tune(self, expr, mut, cv_samples, test_count=8, verbose=False):
-        if test_count == 'auto':
-            test_count = int(16 ** (len(self._tune_params) ** -1.0))
-        if self._tune_params:
-            new_grid = {param:distr.rvs(test_count)
-                        for param,distr in self._param_priors.items()}
-            grid_test = GridSearchCV(
-                estimator=self, param_grid=new_grid,
-                scoring=_score_auc, cv=cv_samples,
-                n_jobs=-1
-                )
-            grid_test.fit(expr, mut)
-            self.set_params(**grid_test.best_params_)
-            for param in self._tune_params.keys():
-                new_mean,new_sd = _update_params(
-                    [(x[param],y)
-                     for x,y in zip(grid_test.cv_results_['params'],
-                                    grid_test.cv_results_['mean_test_score'])
-                    ])
-                self._param_priors[param] = stats.lognorm(
-                    scale=new_mean, s=new_sd)
-            if verbose:
-                print self
-
-    def get_coef(self):
-        return self.named_steps['fit'].coefs_
-
-
-class naiveBayes(UniClassifier):
-    """A class corresponding to gaussian kernal support vector"""
-    """classification of mutation status."""
-
-    _tune_params = {}
-
-    def __init__(self):
+    def __init__(self, mut_genes):
+        self._tune_priors = {
+            'fit__PCdir':stats.beta(a=1, b=1),
+            'fit__PCtype':stats.beta(a=1, b=1),
+            'fit__C':stats.lognorm(scale=exp(-1), s=exp(1)),
+            'fit__gamma':stats.lognorm(scale=exp(1), s=exp(1))
+            }
+        self.path_obj = list(read_sif(mut_genes).values())[0]
+        self.mut_genes = mut_genes
+        feat_step = PathwaySelect(self.path_obj)
         norm_step = StandardScaler()
-        fit_step = naive_bayes.GaussianNB()
+        fit_step = PCsvc(self.path_obj)
         UniClassifier.__init__(self,
-            [('norm', norm_step), ('fit', fit_step)])
+            [('feat', feat_step), ('norm', norm_step), ('fit', fit_step)])
+
+    def fit(self, X, y, **fit_params):
+        self.expr_genes = X.columns
+        new_X = self.named_steps['feat'].fit(X, y, **fit_params).transform(X)
+        mask = self.named_steps['feat']._get_support_mask()
+        old_cols = X.loc[:,mask].columns
+        self.named_steps['fit'].expr_out_indx = [
+            old_cols.get_loc(g)
+            for g in self.path_obj['out']['controls-expression-of']
+            if g in old_cols]
+        self.named_steps['fit'].expr_in_indx = [
+            old_cols.get_loc(g)
+            for g in self.path_obj['in']['controls-expression-of']
+            if g in old_cols]
+        self.named_steps['fit'].state_out_indx = [
+            old_cols.get_loc(g)
+            for g in self.path_obj['out']['controls-state-change-of']
+            if g in old_cols]
+        self.named_steps['fit'].state_in_indx = [
+            old_cols.get_loc(g)
+            for g in self.path_obj['in']['controls-state-change-of']
+            if g in old_cols]
+        new_X = self.named_steps['norm'].fit_transform(new_X, y, **fit_params)
+        self.named_steps['fit'].fit(new_X, y, **fit_params)
+        return self
 
 
-class Lasso(UniClassifier):
-    """A class corresponding to logistic regression classification"""
-    """of mutation status with the lasso regularization penalty."""
+class PCpipe(UniClassifier):
 
-    def __init__(self, mut_genes=None, expr_genes=None):
-        self._tune_params = {'fit__C':1.0}
-        self._param_priors = {'fit__C':stats.lognorm(scale=exp(0), s=2)}
-        self._expr_genes = expr_genes
-        norm_step = StandardScaler()
-        fit_step = LogisticRegression(
-                    penalty='l1', C=self._tune_params['fit__C'],
-                    class_weight={False:1, True:1}
-                    )
+    def __init__(self, mut_genes):
+        self._tune_priors = {}
+        path_obj = list(read_sif(mut_genes).values())[0]
+        self.path_obj = {k:v for k,v in list(path_obj.items()) if k =='out'}
+        self.mut_genes = mut_genes
+        feat_step = PathwaySelect(self.path_obj)
+        norm_step = RobustScaler()
+        fit_step = PCdir()
         UniClassifier.__init__(self,
-            [('norm', norm_step), ('fit', fit_step)])
-        self.set_params(**self._tune_params)
+            [('feat', feat_step), ('norm', norm_step), ('fit', fit_step)])
 
 
 class PCgbc(UniClassifier):
@@ -360,14 +703,14 @@ class PCgbc(UniClassifier):
 
     def __init__(self, mut_genes=None, expr_genes=None):
         self._tune_params = {'I':1.0}
-        self._param_priors = {'I':stats.lognorm(scale=exp(0), s=1)}
+        self._param_priors = {'I':stats.lognorm(scale=1e-3, s=3)}
         self._expr_genes = expr_genes
         kern_genes = {k:list(set(v) & set(expr_genes)) for k,v in
-                      _read_sif(mut_genes)[mut_genes[0]]['out'].items()}
+                      list(read_sif(mut_genes)[mut_genes[0]]['out'].items())}
         self._kern_genes = {k:[[i for i,g
                                 in enumerate(expr_genes) if g == x][0]
                                for x in v]
-                            for k,v in kern_genes.items()}
+                            for k,v in list(kern_genes.items())}
         norm_step = StandardScaler()
         fit_step = gaussian_process.GaussianProcessClassifier(
             kernel=self._pc_kernel)
@@ -381,61 +724,18 @@ class PolyLasso(UniClassifier):
     """of mutation status with the lasso regularization penalty."""
 
     def __init__(self, mut_genes=None, expr_genes=None):
-        self._tune_params = {'fit__C':1.0}
-        self._param_priors = {'fit__C':stats.lognorm(scale=exp(0), s=2)}
-        feat_step = skl.feature_selection.GenericUnivariateSelect(
-            score_func=_gene_meancv,
+        self._tune_priors = {'fit__C':stats.lognorm(scale=1.0, s=2)}
+        feat_step = GenericUnivariateSelect(
+            score_func=_gene_sd,
             mode='k_best',
             param = 200
             )
         norm_step = StandardScaler()
-        poly_step = preprocessing.PolynomialFeatures(2)
-        fit_step = linear_model.LogisticRegression(
-                    penalty='l1', C=self._tune_params['fit__C'],
-                    class_weight={False:1, True:1}
-                    )
+        poly_step = PolynomialFeatures(2)
+        fit_step = LogisticRegression(penalty='l1', tol=5e-3)
         UniClassifier.__init__(self,
             [('feat', feat_step), ('poly', poly_step),
              ('norm', norm_step), ('fit', fit_step)])
-        self.set_params(**self._tune_params)
-
-
-class LassoPCA(UniClassifier):
-    """A class corresponding to logistic regression classification"""
-    """of mutation status with the lasso regularization penalty."""
-
-    def __init__(self, mut_genes=None, expr_genes=None):
-        self._tune_params = {'fit__C':1.0}
-        self._param_priors = {'fit__C':stats.lognorm(scale=exp(0), s=2)}
-        norm_step = StandardScaler()
-        pca_step = decomposition.PCA()
-        fit_step = linear_model.LogisticRegression(
-            penalty='l1', C=self._tune_params['fit__C'],
-            class_weight={False:1, True:1}
-            )
-        UniClassifier.__init__(self,
-            [('norm', norm_step), ('pca', pca_step), ('fit', fit_step)])
-        self.set_params(**self._tune_params)
-
-
-class enSGD(UniClassifier):
-    """A class corresponding to elastic net logreg"""
-    """classification of mutation status."""
-
-    _tune_params = {'fit__l1_ratio':(0.1,0.2,0.4,0.8),
-                    'fit__alpha':[10 ** x for x in range(-5,-2)]}
-
-    def __init__(self, l1_ratio=0.2, alpha=0.001):
-        self.params = {'l1_ratio':l1_ratio, 'alpha':alpha}
-        norm_step = StandardScaler()
-        fit_step = linear_model.SGDClassifier(
-                    loss='log', penalty='elasticnet',
-                    class_weight={False:1, True:1},
-                    l1_ratio=l1_ratio, alpha=alpha
-                    )
-        UniClassifier.__init__(self,
-            [('norm', norm_step), ('fit', fit_step)])
-        self.set_params(**self.params)
 
 
 class Mixture(UniClassifier):
@@ -468,7 +768,7 @@ class Mixture(UniClassifier):
         self.set_params(**self._tune_params)
 
 
-class rbfSVM(UniClassifier):
+class PolyrbfSVM(UniClassifier):
     """A class corresponding to gaussian kernal support vector"""
     """classification of mutation status."""
 
@@ -484,8 +784,8 @@ class rbfSVM(UniClassifier):
         norm_step = StandardScaler()
         feat_step = GeneSelect(
             10**8, 1, self.mut_genes, self.expr_genes)
-        poly_step = preprocessing.PolynomialFeatures(2)
-        fit_step = svm.SVC(
+        poly_step = PolynomialFeatures(2)
+        fit_step = SVC(
             kernel='rbf',
             C=self._tune_params['fit__C'],
             gamma=self._tune_params['fit__gamma'],
@@ -500,27 +800,27 @@ class rbfSVM(UniClassifier):
 
 
 class rbfSVMpc(UniClassifier):
-    """A class corresponding to gaussian kernal support vector"""
+    """A class corresponding toz gaussian kernal support vector"""
     """classification of mutation status."""
 
     _tune_params = {'fit__gamma':[10 ** x for x in range(-12,-3,2)],
                     'fit__C':[10 ** x for x in range(-2,5,2)]}
 
 
-    def __init__(self, mut_genes=None, gamma=0.0001, C=1):
-        if mut_genes is None:
-            mut_genes = self.mut_genes
-        else:
-            self.mut_genes = mut_genes
-        self.link_data = _read_sif(mut_genes)
+    def __init__(self, mut_genes=None, expr_genes=None):
+        self._tune_params = {'fizt__gamma':-6.0}
+        self._param_priors = {'fit__gamma':stats.lognorm(scale=exp(-6), s=3)}
+        self._tune_params = {'fit__C':1.0}
+        self._param_priors = {'fit__C':stats.lognorm(scale=exp(1.0), s=1)}
+        norm_step = StandardScaler()
+        self.link_data = read_sif(mut_genes)
         self.link_params = {
-            g:{'in':{k:10 for k in self.link_data[g]['in'].keys()},
-               'out':{k:100000 for k in self.link_data[g]['out'].keys()}}
+            g:{'in':{k:10 for k in list(self.link_data[g]['in'].keys())},
+               'out':{k:100000 for k in list(self.link_data[g]['out'].keys())}}
             for g in mut_genes
             }
         self.params = {'gamma':gamma, 'C':C}
-        norm_step = StandardScaler()
-        feat_step = skl.feature_selection.GenericUnivariateSelect(
+        feat_step = GenericUnivariateSelect(
             lambda expr,mut: _score_genes(
                 expr, mut, self.gene_list, _mut_ttest, self.link_data,
                 self.link_params),
@@ -538,61 +838,5 @@ class rbfSVMpc(UniClassifier):
              ('feat', feat_step),
              ('fit', fit_step)])
         self.set_params(**self.params)
-
-
-class KNeigh(UniClassifier):
-    """A class corresponding to k-nearest neighbours voting
-       classification of mutation status."""
-       
-    _tune_params = {'fit__n_neighbors':[40,80,120,160,200,240,300]}
-
-    def __init__(self, n_neighbors=100):
-        self.params = {'n_neighbors':n_neighbors}
-        norm_step = StandardScaler()
-        fit_step = neighbors.KNeighborsClassifier(
-            n_neighbors=n_neighbors, weights='distance',
-            algorithm='ball_tree', leaf_size=20
-            )
-        UniClassifier.__init__(self,
-            [('norm', norm_step), ('fit', fit_step)])
-        self.set_params(**self.params)
-
-
-class RBFgbc(UniClassifier):
-    """A class corresponding to gaussian process classifier"""
-    """of mutation status."""
-
-    #_tune_params = {'kernel':[RBF(10**x) for x in range(-2,5)]}
-
-    def __init__(self, mut_genes=None, expr_genes=None):
-        self._expr_genes = expr_genes
-        norm_step = StandardScaler()
-        fit_step = gaussian_process.GaussianProcessClassifier(
-                        kernel=ke)
-        UniClassifier.__init__(self,
-            [('norm', norm_step), ('fit', fit_step)])
-        self.set_params(**self.params)
-
-
-class rForest(UniClassifier):
-    """A class corresponding to random forest classification"""
-    """of mutation status."""
-
-    _tune_params = {'fit__max_features':[0.01,0.02,0.05,0.1,0.2],
-                    'fit__min_samples_leaf':[0.0001,0.02,0.04,0.06]}
-
-    def __init__(self, max_features=0.02, min_samples_leaf=0.0001):
-        self.params = {'max_features':max_features,
-                       'min_samples_leaf':min_samples_leaf}
-        norm_step = StandardScaler()
-        fit_step = ensemble.RandomForestClassifier(
-                    max_features=max_features,
-                    min_samples_leaf=min_samples_leaf,
-                    n_estimators=1000, class_weight={False:1, True:1}
-                    )
-        UniClassifier.__init__(self,
-            [('norm', norm_step), ('fit', fit_step)])
-        self.set_params(**self.params)
-
 
 

@@ -23,7 +23,7 @@ log=$(common_dir)/condor/HetMan/sum-logs/upstrm_$(Process).log
 request_cpus = 16
 
 #Memory requested
-request_memory = 1 GB
+request_memory = 8 GB
 
 #Disk space
 #request_disk = 200 GB

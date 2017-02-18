@@ -15,8 +15,8 @@ import defunct
 import re
 
 from sklearn import model_selection
-from classif import _score_auc
 from scipy.stats import fisher_exact
+from itertools import groupby
 from functools import reduce
 from mutation import MutLevel, MuTree
 
@@ -256,6 +256,63 @@ def get_cnv_gdac(cohort):
     return cnv_data.T
 
 
+# .. functions for reading in pathway data ..
+def read_sif(mut_genes,
+             sif_file='input-data/babur-mutex/data-tcga/Network.sif'):
+    """Gets the edges containing at least one of given genes from a SIF
+       pathway file and arranges them according to the direction of the
+       edge and the type of interaction it represents.
+
+    Parameters
+    ----------
+    mut_genes : array-like, shape (n_genes,)
+        A list of genes whose interactions are to be retrieved.
+
+    sif_file : str, optional
+        A file in SIF format describing gene interactions.
+        The default is the set of interactions used in the MutEx paper.
+
+    Returns
+    -------
+    link_data : dict
+        A list of the interactions that involve one of the given genes.
+    """
+    if isinstance(mut_genes, str):
+        mut_genes = [mut_genes]
+    sif_dt = np.dtype(
+        [('Gene1', np.str_, 16),
+         ('Type', np.str_, 32),
+         ('Gene2', np.str_, 16)])
+    sif_data = np.loadtxt(
+        fname = _base_dir + sif_file, dtype = sif_dt, delimiter = '\t')
+    link_data = {g:{'in':None, 'out':None} for g in mut_genes}
+
+    for gene in mut_genes:
+        in_data = np.sort(sif_data[sif_data['Gene2'] == gene],
+                          order='Type')
+        out_data = np.sort(sif_data[sif_data['Gene1'] == gene],
+                           order='Type')
+        link_data[gene]['in'] = {k:[x['Gene1'] for x in v] for k,v in
+                                 groupby(in_data, lambda x: x['Type'])}
+        link_data[gene]['out'] = {k:[x['Gene2'] for x in v] for k,v in
+                                  groupby(out_data, lambda x: x['Type'])}
+    return link_data
+
+
+def get_graph(gene):
+    """Downloads interaction data from Pathway Commons using their API.
+    """
+    pc = PC()
+    id_url = "idmapping?id=" + gene
+    gene_id = str(list(pc.http_get(id_url, frmt="json").values())[0])
+    graph_url = "graph"
+    params = {'source':gene_id,
+              'kind':'neighborhood',
+              'limit':1, 'format':'BINARY_SIF'}
+    res = pc.http_get(graph_url, frmt=None, params=params)
+    return res
+
+
 # .. classes for combining different datasets ..
 class MutExpr(object):
     """A class corresponding to expression and mutation data
@@ -467,7 +524,7 @@ class MutExpr(object):
                 mut_status)
 
     def test_classif_cv(self,
-                        classif, mtype=None,
+                        clx, mtype=None,
                         gene_list=None, exclude_samps=None,
                         test_indx=list(range(20)), tune_indx=None,
                         final_fit=False, verbose=False):
@@ -476,8 +533,8 @@ class MutExpr(object):
 
         Parameters
         ----------
-        classif : UniClassifier
-            The classifier to test.
+        clx : UniClassifier
+            An instnce of the classifier to test.
 
         mtype : MuType, optional
             The mutation sub-type to test the classifier on.
@@ -528,24 +585,24 @@ class MutExpr(object):
         if tune_indx is not None:
             tune_cvs = [x for i,x in enumerate(train_cv)
                         if i in tune_indx]
-            classif.tune(expr=train_expr, mut=train_mut,
+            clx.tune(expr=train_expr, mut=train_mut,
                          cv_samples=tune_cvs, verbose=verbose)
 
-        print((classif.named_steps['fit']))
+        print((clx.named_steps['fit']))
         perf = np.percentile(model_selection.cross_val_score(
-            estimator=classif, X=train_expr, y=train_mut,
-            scoring=_score_auc, cv=test_cvs, n_jobs=16
+            estimator=clx, X=train_expr, y=train_mut,
+            scoring=clx.score_auc, cv=test_cvs, n_jobs=16
             ), 25)
         if final_fit:
             if exclude_samps is not None:
                 train_mut = [m for s,m in zip(train_expr.index,train_mut)
                              if s in use_samps]
                 train_expr = train_expr.loc[use_samps,:]
-            classif.fit(X=train_expr, y=train_mut)
+            clx.fit(X=train_expr, y=train_mut)
         return perf
 
     def test_classif_full(self,
-                          classif, mtype=None, tune_indx=list(range(5))):
+                          clx, mtype=None, tune_indx=list(range(5))):
         """Test a classifier using by tuning within the training samples,
            training on all of them, and then testing on the testing samples.
 
@@ -574,7 +631,7 @@ class MutExpr(object):
             tune_cvs = [x for i,x in enumerate(train_cv)
                         if i in tune_indx]
             classif.tune(train_expr, train_mut, tune_cvs)
-        classif.fit(train_expr, train_mut)
-        return _score_auc(classif, test_expr, test_mut)
+        clx.fit(train_expr, train_mut)
+        return clx.score_auc(clx, test_expr, test_mut)
 
 
