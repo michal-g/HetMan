@@ -276,6 +276,7 @@ class UniClassifier(Pipeline):
             #        scale=new_mean, s=new_sd)
             if verbose:
                 print(self)
+        return self
 
     def get_coef(self):
         """Gets the coefficients of the classifier."""
@@ -327,6 +328,21 @@ class LogReg(UniClassifier):
             [('norm', norm_step), ('fit', fit_step)])
 
 
+class Ridge(UniClassifier):
+    """A class corresponding to logistic regression classification
+       of mutation status with the lasso regularization penalty.
+    """
+
+    def __init__(self, mut_genes=None, expr_genes=None):
+        self._tune_priors = {
+            'fit__C':stats.lognorm(scale=exp(-1), s=exp(1))}
+        norm_step = RobustScaler()
+        fit_step = LogisticRegression(
+            penalty='l2', tol=1e-2, class_weight='balanced')
+        UniClassifier.__init__(self,
+            [('norm', norm_step), ('fit', fit_step)])
+
+
 class SVCrbf(UniClassifier):
     """A class corresponding to C-support vector classification
        of mutation status with a radial basis kernel.
@@ -365,15 +381,17 @@ class KNeigh(UniClassifier):
     """
 
     def __init__(self, mut_genes=None, expr_genes=None):
-        self._tune_priors = {'fit__n_neighbors':[40,80,120,160,200,240,300]}
+        self._tune_priors = {
+            'fit__n_neighbors':[40,80,120,160,200,240,300],
+            'fit__leaf_size':[5,10,15,20,30,50]}
         norm_step = StandardScaler()
         fit_step = KNeighborsClassifier(
-            weights='distance', algorithm='ball_tree', leaf_size=20)
+            weights='distance', algorithm='ball_tree')
         UniClassifier.__init__(self,
             [('norm', norm_step), ('fit', fit_step)])
 
 
-class RBFgbc(UniClassifier):
+class GBCrbf(UniClassifier):
     """A class corresponding to gaussian process classification
        of mutation status with a radial basis kernel.
     """
@@ -389,13 +407,14 @@ class RBFgbc(UniClassifier):
 class NewTest(UniClassifier):
     """A class for testing miscellaneous new classification pipelines."""
 
-    def __init__(self, mut_genes=None):
+    def __init__(self, mut_genes=None, expr_genes=None):
         self._tune_priors = {
             'proj__eps':[0.2,0.5,0.8],
-            'fit__C':stats.lognorm(scale=exp(1), s=exp(1))}
+            'fit__C':stats.lognorm(scale=exp(-1), s=exp(2))}
         proj_step = GaussianRandomProjection()
         feat_step = PolynomialFeatures(2)
-        fit_step = LogisticRegression(penalty='l1', tol=2e-2)
+        fit_step = LogisticRegression(
+            penalty='l2', tol=1e-2, class_weight='balanced')
         UniClassifier.__init__(self,
             [('proj', proj_step), ('feat', feat_step), ('fit', fit_step)])
 
