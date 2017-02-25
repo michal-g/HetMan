@@ -90,6 +90,7 @@ class MuTree(object):
     def _muts_protein(muts):
         return muts
 
+    # maps mutation data parsing functions to mutation levels
     mut_fxs = {
         MutLevel.Gene: _muts_gene,
         MutLevel.Form: _muts_form,
@@ -106,12 +107,14 @@ class MuTree(object):
         self.depth = depth
         self.cur_level = MutLevel[levels[depth]]
 
+        # gets subset of mutation data corresponding to requested gene(s)
         if genes is None:
             genes = set(muts['Gene'])
         else:
             gene_indx = [g in genes for g in muts['Gene']]
             muts = muts.ix[gene_indx, ]
 
+        # gets subset of mutation data corresponding to requested samples
         if samples is None:
             samples = set(muts['Sample'])
         else:
@@ -119,6 +122,7 @@ class MuTree(object):
             samp_indx = [s in samples for s in muts['Sample']]
             muts = muts.ix[samp_indx, ]
 
+        # recursively builds the mutation hierarchy
         muts = MuTree.mut_fxs[self.cur_level](muts)
         self.child = {}
         for nm,mut in muts.groupby(self.cur_level.name):
@@ -599,7 +603,8 @@ class MuType(object):
 
         # gets the subsets of mutations defined at this level, and
         # their further subdivisions if they exist
-        membs = [(k,) if isinstance(k, str) else k for _,k in list(set_key.keys())]
+        membs = [(k,) if isinstance(k, str) else k
+                 for _,k in list(set_key.keys())]
         children = dict(
             tuple((v, ch)) if isinstance(ch, MuType) or ch is None else
             tuple((v, MuType(ch)))
@@ -610,7 +615,8 @@ class MuType(object):
         # missense:None, frameshift:None => (missense,frameshift):None
         uniq_ch = set(children.values())
         self.child = {frozenset(i for j in
-                                [k for k,v in list(children.items()) if v == ch]
+                                [k for k,v in list(children.items())
+                                 if v == ch]
                                 for i in j):ch for ch in uniq_ch}
 
     def __eq__(self, other):
@@ -642,7 +648,8 @@ class MuType(object):
         "Returns the expanded key of a MuType."
         rmembs = reduce(lambda x,y: x|y, list(self.child.keys()))
         return {memb:reduce(lambda x,y: x|y,
-                            [v for k,v in list(self.child.items()) if memb in k])
+                            [v for k,v in list(self.child.items())
+                             if memb in k])
                 for memb in rmembs}
 
     def __or__(self, other):
@@ -804,9 +811,8 @@ class MuType(object):
 
         Parameters
         ----------
-        mtype : MuType or MutSet, optional
-            The set of mutation types whose samples we want to retrieve.
-            The default is to use all mutation types stored in the tree.
+        mtree : MuTree
+            A set of samples organized according to the mutations they have.
 
         Returns
         -------
@@ -926,9 +932,11 @@ class MuType(object):
         orig_size = len(self.get_samples(mtree))
         min_samps = max(int(round(orig_size * min_prop)), min_size)
         prune_sets = [x for x in [MutSet('AND NOT', self, MuType(m))
-             for m in self.invert(mtree).subkeys()] if min_samps <= len(x.get_samples(mtree)) < orig_size]
+                                  for m in self.invert(mtree).subkeys()]
+                      if min_samps <= len(x.get_samples(mtree)) < orig_size]
         sub_groups = [MuType(m) for m in self.subkeys()]
         sub_list = [mtree.direct_subsets(m) for m in sub_groups]
+
         for i in range(len(sub_list)):
             if not sub_list[i]:
                 sub_list[i] = [sub_groups[i]]
@@ -937,13 +945,16 @@ class MuType(object):
             sub_groups = [self]
             sub_list = [reduce(lambda x,y: x+y, sub_list)]
             sub_lens = [len(sub_groups)]
+
         sub_sizes = [len(m.get_samples(mtree)) for m in sub_groups]
         test_count = 1
         for x in sub_lens:
             test_count *= 2**x - 1
         test_count -= 1
+
         if test_count > 1000:
             max_subs = [1000 ** (float(x)/sum(sub_sizes)) for x in sub_sizes]
+
             for i in range(len(sub_list)):
                 if max_subs[i] > (2**sub_lens[i] - 1):
                     for j in range(len(sub_list))[(i+1):]:
@@ -956,6 +967,7 @@ class MuType(object):
                     key=lambda y: y[1],
                     reverse=True
                     )
+
                 while len(sub_indx) > max(ceil(log(max_subs[i], 2)), 1):
                     new_sub = sub_indx[-2][0] | sub_indx[-1][0]
                     sub_indx = sub_indx[:-2]
@@ -980,6 +992,7 @@ class MuType(object):
                         use_sets += [new_set]
             use_sets = list(set(use_sets))
             prune_count = len(use_sets) + len(prune_sets)
+
             if prune_count > max_part:
                 subs_prune = [(i,x[0]) for i,x in
                               enumerate(zip(sub_sizes,sub_list))
@@ -993,10 +1006,14 @@ class MuType(object):
                     key=lambda y: y[1],
                     reverse=True
                     )
+
                 new_sub = sub_indx[-2][0] | sub_indx[-1][0]
                 sub_indx = sub_indx[:-2]
                 new_indx = (new_sub, float(len(new_sub.get_samples(mtree))))
                 sort_indx = sum([new_indx[1] < v for _,v in sub_indx])
                 sub_indx.insert(sort_indx, new_indx)
                 sub_list[min_indx] = [x[0] for x in sub_indx]
+
         return use_sets + prune_sets
+
+

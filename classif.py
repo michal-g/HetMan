@@ -8,18 +8,16 @@ classification ensembles of mutation sub-types.
 
 # Author: Michal Grzadkowski <grzadkow@ohsu.edu>
 
-from data import read_sif, get_graph
+from data import get_pc2_neighb
 from itertools import chain
-from math import log, exp
 import re
 import dill as pickle
 from functools import reduce
 
+from math import log, exp
 import numpy as np
 from scipy import stats
 import dirichlet
-from bioservices.pathwaycommons import PathwayCommons as PC
-from bioservices.services import REST, BioServicesError
 
 from sklearn.feature_selection.base import SelectorMixin
 from sklearn.svm.base import BaseSVC
@@ -221,6 +219,9 @@ class UniClassifier(Pipeline):
             )
 
     def prob_mut(self, expr):
+        """Returns the probability of mutation presence calculated by the
+           classifier based on the given expression matrix.
+        """
         mut_scores = self.predict_proba(expr)
         if hasattr(self, 'classes_'):
             true_indx = [i for i,x in enumerate(self.classes_) if x]
@@ -420,48 +421,61 @@ class NewTest(UniClassifier):
 
 
 # .. classifiers that use Pathway Commons as prior information ..
-class PCsvc(SVC):
-    """A kernel based on Pathway Commons neighbours."""
+class SVCpath(SVC):
+    """A Support Vector Machine classifier with a radial basis kernel
+       based on Pathway Commons neighbours.
+    """
 
-    def _pc_kernel(self, X, Y=None):
-        norm_val = self.PCdir + self.PCtype
-        if Y is not None:
-            expr_out_kern = rbf_kernel(
-                X[:,self.expr_out_indx], Y[:,self.expr_out_indx],
-                gamma=self.gamma)
-            expr_in_kern = rbf_kernel(
-                X[:,self.expr_in_indx], Y[:,self.expr_in_indx],
-                gamma=self.gamma)
-            state_out_kern = rbf_kernel(
-                X[:,self.state_out_indx], Y[:,self.state_out_indx],
-                gamma=self.gamma)
-            state_in_kern = rbf_kernel(
-                X[:,self.state_in_indx], Y[:,self.state_in_indx],
-                gamma=self.gamma)
-        else:
-            expr_out_kern = rbf_kernel(
-                X[:,self.expr_out_indx], gamma=self.gamma)
-            expr_in_kern = rbf_kernel(
-                X[:,self.expr_in_indx], gamma=self.gamma)
-            state_out_kern = rbf_kernel(
-                X[:,self.state_out_indx], gamma=self.gamma)
-            state_in_kern = rbf_kernel(
-                X[:,self.state_in_indx], gamma=self.gamma)
+    def pc_kernel(self, X, Y=None):
+        X,Y = check_pairwise_arrays(X,Y)
+        out_kern = np.zeros((X.shape[0], Y.shape[0]))
+        for dr,dmix in self.dir_mix.items():
+            for tp,tmix in self.type_mix.items():
+                gn_indx = [i for i,x in enumerate(self.expr_genes)
+                           if x in self.path_obj[dr][tp]]
+                out_kern += rbf_kernel(X[:, gn_indx], Y[:, gn_indx],
+                                       gamma=self.gamma) * dmix * tmix
+        return out_kern
 
-        return (
-            ((expr_out_kern * (self.PCdir * self.PCtype))
-             + (expr_in_kern * ((1 - self.PCdir) * self.PCtype))
-             + (state_out_kern * (self.PCdir * (1 - self.PCtype)))
-             + (state_in_kern * ((1 - self.PCdir) * (1 - self.PCtype)))
-            ) / norm_val)
+    def __init__(self,
+                 mut_gene, expr_genes,
+                 dir_mix={'Up': 1.0/3, 'Down':2.0/3}, type_mix=None,
+                 C=1.0, gamma=1.0):
+        self.path_obj = get_pc2_neighb(mut_gene)
+        self.expr_genes = expr_genes
 
-    def __init__(self, path_obj, PCdir=0.5, PCtype=0.5, C=1, gamma=1):
-        self.path_obj = path_obj
-        self.PCdir = PCdir
-        self.PCtype = PCtype
-        self.gamma = gamma
-        SVC.__init__(self, kernel=self._pc_kernel, gamma=gamma, C=C,
-                     probability=True, max_iter=1e4)
+        if not dir_mix or dir_mix is None:
+            dir_mix = {k:1.0 for k in self.path_obj.keys()}
+        self.dir_mix = {k:(v/sum(list(dir_mix.values())))
+                   for k,v in dir_mix.items()}
+        if not type_mix or type_mix is None:
+            type_mix = {
+                k:1.0 for k in reduce(
+                    lambda x,y: x|y,
+                    [set(v.keys()) for v in self.path_obj.values()])
+                }
+        self.type_mix = {k:(v/sum(list(type_mix.values())))
+                         for k,v in type_mix.items()}
+        SVC.__init__(self, kernel=self.pc_kernel, C=C, gamma=gamma)
+        self.set_params(mut_gene=mut_gene)
+
+
+class SVCpcRS(UniClassifier):
+    """A class corresponding to Pathway Commons - based classification
+       of mutation status using robust standardization.
+    """
+
+    def __init__(self, mut_genes, expr_genes):
+        self._tune_priors = {
+            'fit__C':stats.lognorm(scale=exp(-1), s=exp(1)),
+            'fit__gamma':stats.lognorm(scale=1e-5, s=exp(2))}
+        norm_step = StandardScaler()
+        fit_step = SVCpath(
+            mut_gene=mut_genes[0], expr_genes=expr_genes,
+            dir_mix={'Down':1.0}, type_mix={'controls-state-change-of':1.0})
+        UniClassifier.__init__(self,
+                               [('norm', norm_step), ('fit', fit_step)])
+        self.set_params(mut_genes=mut_genes, expr_genes=expr_genes)
 
 
 class PCdir(BaseSVC):

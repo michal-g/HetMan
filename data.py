@@ -19,6 +19,7 @@ from scipy.stats import fisher_exact
 from itertools import groupby
 from functools import reduce
 from mutation import MutLevel, MuTree
+from bioservices import PathwayCommons 
 
 
 # .. directories containing raw -omics data and cross-validation samples ..
@@ -257,6 +258,51 @@ def get_cnv_gdac(cohort):
 
 
 # .. functions for reading in pathway data ..
+def get_pc2_neighb(gene):
+    """Gets the neighbourhood of a gene as defined by Pathway Commons."""
+    pc2 = PathwayCommons(verbose=False)
+    pc2.settings.TIMEOUT = 1000
+    neighb = {}
+
+    # sets the parameters of the PC2 query
+    url = 'graph'
+    gene_id = pc2.idmapping(gene)[gene]
+    params = {'format': 'BINARY_SIF',
+              'kind': 'neighborhood',
+              'limit': 1,
+              'source': 'http://identifiers.org/uniprot/' + gene_id}
+
+    # runs the PC2 query, makes sure the output has the correct format
+    while True:
+        try:
+            print("Reading in Pathway Commons data...")
+            raw_data = pc2.http_get(url, frmt=None, params=params)
+            sif_data = raw_data.splitlines()
+            sif_data = [x.split() for x in sif_data]
+            break
+        except:
+            print("PC2 API download failed, trying again...")
+
+    # parses interaction data according to direction
+    up_neighbs = sorted([(x[1], x[0]) for x in sif_data if x[2] == gene],
+                        key=lambda x: x[0])
+    down_neighbs = sorted([(x[1], x[2]) for x in sif_data if x[0] == gene],
+                          key=lambda x: x[0])
+    other_neighbs = sorted([x for x in sif_data
+                            if x[0] != gene and x[2] != gene],
+                           key=lambda x: x[1])
+
+    # parses according to interaction type
+    neighb['Up'] = {k:[x[1] for x in v] for k,v in
+                    groupby(up_neighbs, lambda x: x[0])}
+    neighb['Down'] = {k:[x[1] for x in v] for k,v in
+                      groupby(down_neighbs, lambda x: x[0])}
+    neighb['Other'] = {k:[(x[0],x[2]) for x in v] for k,v in
+                       groupby(other_neighbs, lambda x: x[1])}
+
+    return neighb
+
+
 def read_sif(mut_genes,
              sif_file='input-data/babur-mutex/data-tcga/Network.sif'):
     """Gets the edges containing at least one of given genes from a SIF
@@ -297,20 +343,6 @@ def read_sif(mut_genes,
         link_data[gene]['out'] = {k:[x['Gene2'] for x in v] for k,v in
                                   groupby(out_data, lambda x: x['Type'])}
     return link_data
-
-
-def get_graph(gene):
-    """Downloads interaction data from Pathway Commons using their API.
-    """
-    pc = PC()
-    id_url = "idmapping?id=" + gene
-    gene_id = str(list(pc.http_get(id_url, frmt="json").values())[0])
-    graph_url = "graph"
-    params = {'source':gene_id,
-              'kind':'neighborhood',
-              'limit':1, 'format':'BINARY_SIF'}
-    res = pc.http_get(graph_url, frmt=None, params=params)
-    return res
 
 
 # .. classes for combining different datasets ..
@@ -646,6 +678,8 @@ class MutExpr(object):
                 method='prob_mut', cv=pred_cvs, n_jobs=16
                 ) / len(pred_indx)
 
+        pred_scores = pd.Series(pred_scores.tolist(), dtype=np.float)
+        pred_scores.index = self.train_expr_.index
         return pred_scores
 
     def test_clf(self,
