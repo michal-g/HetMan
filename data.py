@@ -13,6 +13,7 @@ import pandas as pd
 import random
 import defunct
 import re
+import sys
 
 from sklearn import model_selection
 from scipy.stats import fisher_exact
@@ -39,7 +40,7 @@ def parse_tcga_barcodes(barcodes):
 
 def log_norm_expr(expr):
     """Log-normalizes expression data."""
-    log_add = np.min(np.min(expr[expr > 0])) * 0.5
+    log_add = np.amin(expr[expr > 0]) * 0.5
     return np.log2(expr + log_add)
 
 
@@ -273,17 +274,16 @@ def get_pc2_neighb(gene):
               'source': 'http://identifiers.org/uniprot/' + gene_id}
 
     # runs the PC2 query, makes sure the output has the correct format
-    while True:
-        try:
-            print("Reading in Pathway Commons data...")
-            raw_data = pc2.http_get(url, frmt=None, params=params)
-            sif_data = raw_data.splitlines()
-            sif_data = [x.split() for x in sif_data]
-            break
-        except:
-            print("PC2 API download failed, trying again...")
+    raw_data = 0
+    while isinstance(raw_data, int):
+        print("Reading in Pathway Commons data for gene " + gene + "...")
+        raw_data = pc2.http_get(url, frmt=None, params=params)
+        print(type(raw_data))
 
+    print("Moving on...")
     # parses interaction data according to direction
+    sif_data = raw_data.splitlines()
+    sif_data = [x.split() for x in sif_data]
     up_neighbs = sorted([(x[1], x[0]) for x in sif_data if x[2] == gene],
                         key=lambda x: x[0])
     down_neighbs = sorted([(x[1], x[2]) for x in sif_data if x[0] == gene],
@@ -393,9 +393,10 @@ class MutExpr(object):
 
     def __init__(self,
                  syn, cohort, mut_genes,
-                 mut_levels=('Gene', 'Form', 'Protein'),
-                 cv_info={'Prop': 2.0/3, 'Seed':1}):
+                 mut_levels=('Gene', 'Form', 'Protein'), cv_info=None):
         self.cohort_ = cohort
+        if cv_info is None:
+            cv_info = {'Prop': 2.0/3, 'Seed':1}
         self.intern_cv_ = cv_info['Seed'] ** 2
         self.mut_genes = mut_genes
 
@@ -532,7 +533,7 @@ class MutExpr(object):
                         mut=tune_muts, cv_samples=tune_cvs, verbose=verbose)
 
     def score_clf(self,
-                  clf, score_indx=list(range(16)), tune_indx=None, mtype=None,
+                  clf, score_indx=tuple(range(16)), tune_indx=None, mtype=None,
                   gene_list=None, exclude_samps=None, final_fit=False,
                   verbose=False):
         """Test a classifier using tuning and cross-validation
@@ -603,7 +604,7 @@ class MutExpr(object):
 
     def predict_clf(self,
                     clf, mtype=None, gene_list=None, exclude_samps=None,
-                    pred_indx=list(range(16)), tune_indx=None,
+                    pred_indx=tuple(range(16)), tune_indx=None,
                     final_fit=False, verbose=False):
         """Test a classifier using tuning and cross-validation
            within the training samples of this dataset.

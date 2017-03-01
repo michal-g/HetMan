@@ -3,6 +3,10 @@
 KBTL (Kernelized Bayesian Transfer Learning)
 Sharing knowledge between related but distinct tasks to improve
 classification using an efficient variational approximation techniques.
+
+Ported into python from the original Matlab code written by Mehmet Gonen and
+available at https://github.com/mehmetgonen/kbtl and described in further
+detail in http://www.aaai.org/ocs/index.php/AAAI/AAAI14/paper/view/8132.
 """
 
 # Author: Michal Grzadkowski <grzadkow@ohsu.edu>
@@ -13,9 +17,16 @@ from sklearn import metrics
 from scipy.stats import norm
 from math import log
 
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import (
+    StandardScaler, PolynomialFeatures, RobustScaler)
+from sklearn.metrics import roc_auc_score
+from sklearn.metrics.pairwise import (
+    rbf_kernel, check_pairwise_arrays, pairwise_distances)
+
 
 # .. helper functions for use in variational approximation ..
-def _bhatta_dist(dist1, dist2):
+def bhatta_dist(dist1, dist2):
     """Calculates Bhattacharyya distance between two normal distributions.
        See https://en.wikipedia.org/wiki/Bhattacharyya_distance for details.
 
@@ -37,6 +48,61 @@ def _bhatta_dist(dist1, dist2):
            )
 
 
+# .. classes for organizing transfer classifiers into data pipelines ..
+class MultiPipe(Pipeline):
+    """A class corresponding to expression-based classifiers of mutation
+       status that use multiple expr-mut datasets.
+    """
+
+    def __init__(self, steps):
+        Pipeline.__init__(self, steps)
+
+    def fit(self, X_list, y_list=None, **fit_params):
+        """Fit the model - fit all of the transforms in succession and
+           transform the data, then fit the transformed data using the
+           final estimator.
+        """
+        for name, transform in self.steps[:-1]:
+            if transform is None:
+                pass
+            elif hasattr(transform, "fit_transform"):
+                Xt_list = [transform.fit_transform(
+                    Xt, y, **fit_params_steps[name])
+                    for Xt,y in zip(Xt_list, y_list)]
+            else:
+                Xt_list = [transform.fit(Xt, y, **fit_params_steps[name])
+                           for Xt,y in zip(Xt_list, y_list)]
+
+        if self._final_estimator is not None:
+            self._final_estimator.fit(Xt_list, y_list, **fit_params)
+        return self
+
+    def fit_transform(self, X_list, y_list=None, **fit_params):
+        pass
+
+    def predict(self, X_list):
+        pass
+
+    def fit_predict(self, X_list, y_list=None, **fit_params):
+        pass
+
+    def predict_proba(self, X_list):
+        pass
+
+
+class MultiClf(object):
+    """A class corresponding to expression-based classifiers of mutation
+       status that use multiple expr-mut datasets.
+    """
+
+    def __init__(self, mut_genes=None, expr_genes=None):
+        norm_step = StandardScaler()
+        fit_step = KBTL()
+        MultiPipe.__init__(self,
+            [('norm', norm_step), ('fit', fit_step)])
+
+
+# .. transfer learning classifiers ..
 class KBTL(object):
     """Kernel based transfer learning classifier adapted for use in HetMan
        optimizers. 
@@ -58,29 +124,41 @@ class KBTL(object):
 
     def __init__(self,
                  kernel='rbf', R=20, sigma_h=0.1,
-                 lambda_par={'a':1.0,'b':1.0}, gamma_par={'a':1.0,'b':1.0},
-                 eta_par={'a':1.0,'b':1.0}, margin=1.0,
+                 lambda_par=(1.0, 1.0), gamma_par=(1.0, 1.0),
+                 eta_par=(1.0, 1.0), margin=1.0,
                  max_iter=50, stopping_tol=1e-3):
-        self.R = R
         self.kernel = kernel
+        self.R = R
         self.sigma_h = sigma_h
-        self.lambda_par = lambda_par
-        self.gamma_par = gamma_par
-        self.eta_par = eta_par
+        self.lambda_par = {'a':lambda_par[0], 'b':lambda_par[1]}
+        self.gamma_par = {'a':gamma_par[0], 'b':gamma_par[1]}
+        self.eta_par = {'a':eta_par[0], 'b':eta_par[1]}
         self.margin = margin
         self.max_iter = max_iter
         self.stopping_tol = stopping_tol
 
-    def fit(self, X_list, y_list, verbose=False):
-        # calculates kernel matrices
-        data_count = [x.shape[0] for x in X_list]
-        if self.kernel == 'rbf':
+    def compute_kernel(self, X_list):
+        """Gets the kernel matrices from a list of feature matrices."""
+
+        if callable(self.kernel):
+            kernel_list = [self.kernel(X, X) for X in X_list]
+        elif self.kernel == 'rbf':
             X_gamma = [np.mean(metrics.pairwise.pairwise_distances(x))
                        for x in X_list]
             kernel_list = [metrics.pairwise.rbf_kernel(x,gamma=gam**-2.0)
                            for x,gam in zip(X_list, X_gamma)]
         elif self.kernel == 'linear':
             pass
+        else:
+            raise InputError("Unknown kernel "
+                             + str(self.kernel) + " specified!")
+
+        return kernel_list 
+
+    def fit(self, X_list, y_list, verbose=False):
+        """Fits the classifier."""
+        kernel_list = self.compute_kernel(X_list)
+        data_count = [x.shape[0] for x in X_list]
         y_list = [[1.0 if x else -1.0 for x in y] for y in y_list]
 
         # initializes matrix of priors for task-specific projection matrices
@@ -317,4 +395,5 @@ class KBTL(object):
     def set_params(self, **kwargs):
         for k,v in kwargs.iteritems():
             setattr(self, k, v)
+
 

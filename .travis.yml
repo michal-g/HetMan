@@ -11,7 +11,7 @@ install:
         - conda update -q conda
         - conda info -a
         - conda install nbformat
-        - conda env create -f HetMan.yml
+        - conda env create
         - source activate HetMan
 
 script: pytest -vv test_hetman.py

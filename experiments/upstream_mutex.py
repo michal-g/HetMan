@@ -22,11 +22,16 @@ def main(argv):
     down_mtype = MuType({('Gene', down_gene):None})
 
     # load in expression and mutation datasets
-    syn = synapseclient.Synapse()
-    syn.login('grzadkow', 'W0w6g1i8A')
-    cdata = data.MutExpr(
-        syn, cohort=argv[0], mut_genes=[up_gene,down_gene],
-        cv_info={'Prop':2/3.0, 'Seed':int(argv[-1])+1})
+    while True:
+        try:
+            syn = synapseclient.Synapse()
+            syn.login('grzadkow', 'W0w6g1i8A')
+            cdata = data.MutExpr(
+                syn, cohort=argv[0], mut_genes=[up_gene,down_gene],
+                cv_info={'Prop':2/3.0, 'Seed':int(argv[-1])+1})
+            break
+        except:
+            print("Synapse login failed, trying again...")
 
     # define the classifier to be used as well as the interval
     # cross-validation training samples for testing and tuning
@@ -35,9 +40,9 @@ def main(argv):
         clf = eval('classif.' + clf_lbl)
     else:
         raise InputError("Unknown classifier specified!")
-    score_indx = list(range(24))
+    score_indx = list(range(8))
     pred_indx = list(range(24,48))
-    tune_indx = list(range(56,60))
+    tune_indx = list(range(56,58))
     expr_genes = cdata.train_expr_.columns
 
     # test genes' mutations individually
@@ -45,6 +50,7 @@ def main(argv):
     up_test = cdata.score_clf(
         clf=clf(mut_genes=[up_gene], expr_genes=expr_genes),
         mtype=up_mtype, score_indx=score_indx, tune_indx=tune_indx)
+    print(str(up_test))
     down_test = cdata.score_clf(
         clf=clf(mut_genes=[down_gene], expr_genes=expr_genes),
         mtype=down_mtype, score_indx=score_indx, tune_indx=tune_indx)
