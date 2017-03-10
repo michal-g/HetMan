@@ -183,15 +183,17 @@ class UniPipe(Pipeline):
     """
 
     def __init__(self, steps):
-        Pipeline.__init__(self, steps)
+        super(UniPipe, self).__init__(steps)
 
     def __str__(self):
+        """Prints the tuned parameters of the classifier."""
         param_list = self.get_params()
-        return reduce(
+        param_str = reduce(
             lambda x,y: x + ', ' + y,
             [k + ': ' + str(param_list[k])
              for k in list(self._tune_priors.keys())]
             )
+        return type(self).__name__ + ' with ' + param_str
 
     def prob_mut(self, expr):
         """Returns the probability of mutation presence calculated by the

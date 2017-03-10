@@ -11,18 +11,19 @@ detail in http://www.aaai.org/ocs/index.php/AAAI/AAAI14/paper/view/8132.
 
 # Author: Michal Grzadkowski <grzadkow@ohsu.edu>
 
-import numpy as np
 from random import gauss as rnorm
-from sklearn import metrics
-from scipy.stats import norm
-from math import log
+from math import log, exp
+import collections
 
+import numpy as np
+from scipy import stats
+
+from sklearn import metrics
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import (
     StandardScaler, PolynomialFeatures, RobustScaler)
-from sklearn.metrics import roc_auc_score
-from sklearn.metrics.pairwise import (
-    rbf_kernel, check_pairwise_arrays, pairwise_distances)
+import sklearn.model_selection._validation
+from sklearn.utils import safe_indexing
 
 
 # .. helper functions for use in variational approximation ..
@@ -48,54 +49,142 @@ def bhatta_dist(dist1, dist2):
            )
 
 
-# .. classes for organizing transfer classifiers into data pipelines ..
+def _safe_split(estimator, X_list, y_list, indx_list, train_indx_list=None):
+    """Overrides sklearn function for use in transfer learning."""
+
+    from sklearn.gaussian_process.kernels import Kernel as GPKernel
+    if (hasattr(estimator, 'kernel') and callable(estimator.kernel)
+        and not isinstance(estimator.kernel, GPKernel)):
+            raise ValueError("Cannot use a custom kernel function, "
+                             "precompute the kernel matrix instead.")
+    
+    X_subset = [[] for _ in X_list]
+    y_subset = [[] for _ in y_list]
+
+    for i, (X,indices) in enumerate(zip(X_list, indx_list)):
+        if not hasattr(X, "shape"):
+            if getattr(estimator, "_pairwise", False):
+                raise ValueError(
+                    "Precomputed kernels or affinity matrices have "
+                    "to be passed as arrays or sparse matrices.")
+            X_subset[i] = [X[index] for index in indices]
+
+        else:
+            if getattr(estimator, "_pairwise", False):
+                if X.shape[0] != X.shape[1]:
+                    raise ValueError("X should be a square kernel matrix.")
+                if train_indx_list is None:
+                    X_subset[i] = X[np.ix_(indices, indices)]
+                else:
+                    X_subset[i] = X[np.ix_(indices, train_indx_list[i])]
+            else:
+                X_subset[i] = safe_indexing(X, indices)
+
+        if y_list[i] is not None:
+            y_subset[i] = safe_indexing(y_list[i], indices)
+        else:
+            y_subset[i] = None
+
+    return X_subset, y_subset
+
+
 class MultiPipe(Pipeline):
     """A class corresponding to expression-based classifiers of mutation
        status that use multiple expr-mut datasets.
     """
 
     def __init__(self, steps):
-        Pipeline.__init__(self, steps)
+        super(MultiPipe, self).__init__(steps)
 
-    def fit(self, X_list, y_list=None, **fit_params):
+    def _fit(self, X_list, y_list=None, **fit_params):
         """Fit the model - fit all of the transforms in succession and
            transform the data, then fit the transformed data using the
            final estimator.
         """
+        self._validate_steps()
+        fit_params_steps = dict((name, {}) for name, step in self.steps
+                                if step is not None)
+        for pname, pval in fit_params.items():
+            step, param = pname.split('__', 1)
+            fit_params_steps[step][param] = pval
+        Xt_list = X_list
+
+        for i in range(len(self.steps[:-1])):
+            if self.steps[i][1] is not None:
+                self.steps[i] = (self.steps[i][0],
+                                 tuple(type(self.steps[i][1])() for _ in X_list))
+
         for name, transform in self.steps[:-1]:
             if transform is None:
                 pass
             elif hasattr(transform, "fit_transform"):
-                Xt_list = [transform.fit_transform(
+                Xt_list = [transform[i].fit_transform(
                     Xt, y, **fit_params_steps[name])
-                    for Xt,y in zip(Xt_list, y_list)]
+                    for i, (Xt,y) in enumerate(zip(Xt_list, y_list))]
             else:
-                Xt_list = [transform.fit(Xt, y, **fit_params_steps[name])
-                           for Xt,y in zip(Xt_list, y_list)]
+                Xt_list = [transform[i].fit(
+                    Xt, y, **fit_params_steps[name]).transform(Xt)
+                    for i, (Xt,y) in enumerate(zip(Xt_list, y_list))]
 
-        if self._final_estimator is not None:
-            self._final_estimator.fit(Xt_list, y_list, **fit_params)
-        return self
+        if self._final_estimator is None:
+            return Xt_list, {}
+        else:
+            return Xt_list, fit_params_steps[self.steps[-1][0]]
 
-    def fit_transform(self, X_list, y_list=None, **fit_params):
-        pass
+    def _pretransform(self, X_list):
+        """Applies all of the transforms save the final one."""
+        Xt_list = X_list
+        for name, transform in self.steps[:-1]:
+            if transform is not None:
+                Xt_list = [transform[i].transform(Xt)
+                           for i, Xt in enumerate(Xt_list)]
+        return Xt_list
 
     def predict(self, X_list):
-        pass
-
-    def fit_predict(self, X_list, y_list=None, **fit_params):
-        pass
+        """Apply transforms to the data, and predict
+           with the final estimator
+        """
+        Xt_list = self._pretransform(X_list)
+        return self.steps[-1][-1].predict(Xt_list)
 
     def predict_proba(self, X_list):
-        pass
+        """Apply transforms to the data, and predict
+           with the final estimator
+        """
+        Xt_list = self._pretransform(X_list)
+        return self.steps[-1][-1].predict_proba(Xt_list)
+
+    @classmethod
+    def score_auc(cls, estimator, expr_list, mut_list):
+        mut_scores = estimator.predict_proba(expr_list)
+        return np.mean([metrics.roc_auc_score(mut, mut_sc)
+                        for mut,mut_sc in zip(mut_list, mut_scores)])
+
+    def tune(self, expr_list, mut_list, cv_samples, test_count=8,
+             update_priors=False, verbose=False):
+        if self._tune_priors:
+            sklearn.model_selection._validation._safe_split = _safe_split
+            grid_test = sklearn.model_selection._search.RandomizedSearchCV(
+                estimator=self, param_distributions=self._tune_priors,
+                n_iter=test_count, scoring=self.score_auc, cv=cv_samples)
+            grid_test.fit(expr_list, mut_list)
+
+            tune_scores = (grid_test.cv_results_['mean_test_score']
+                           - grid_test.cv_results_['std_test_score'])
+            self.set_params(
+                **grid_test.cv_results_['params'][tune_scores.argmax()])
+
+        return self
 
 
-class MultiClf(object):
+class MultiClf(MultiPipe):
     """A class corresponding to expression-based classifiers of mutation
        status that use multiple expr-mut datasets.
     """
 
     def __init__(self, mut_genes=None, expr_genes=None):
+        self._tune_priors = {
+            'fit__sigma_h': stats.lognorm(scale=exp(-1), s=exp(1))}
         norm_step = StandardScaler()
         fit_step = KBTL()
         MultiPipe.__init__(self,
@@ -140,7 +229,7 @@ class KBTL(object):
     def compute_kernel(self, X_list):
         """Gets the kernel matrices from a list of feature matrices."""
 
-        if callable(self.kernel):
+        if isinstance(self.kernel, collections.Callable):
             kernel_list = [self.kernel(X, X) for X in X_list]
         elif self.kernel == 'rbf':
             X_gamma = [np.mean(metrics.pairwise.pairwise_distances(x))
@@ -163,50 +252,50 @@ class KBTL(object):
 
         # initializes matrix of priors for task-specific projection matrices
         lambdas = [{'alpha': np.matrix([[self.lambda_par['a'] + 0.5
-                                         for i in xrange(self.R)]
-                                        for j in xrange(d_count)]),
+                                         for i in range(self.R)]
+                                        for j in range(d_count)]),
                     'beta': np.matrix([[self.lambda_par['b']
-                                        for i in xrange(self.R)]
-                                       for j in xrange(d_count)])}
+                                        for i in range(self.R)]
+                                       for j in range(d_count)])}
                    for d_count in data_count]
 
         # initializes task-specific projection matrices
         A_list = [{'mu': np.matrix([[rnorm(0,1)
-                                     for i in xrange(self.R)]
-                                    for j in xrange(d_count)]),
-                   'sigma': np.array([np.diag([1.0 for i in xrange(d_count)])
-                                      for r in xrange(self.R)])}
+                                     for i in range(self.R)]
+                                    for j in range(d_count)]),
+                   'sigma': np.array([np.diag([1.0 for i in range(d_count)])
+                                      for r in range(self.R)])}
                   for d_count in data_count]
 
         # initializes task-specific representations in shared sub-space
         H_list = [{'mu': np.matrix([[rnorm(0,1)
-                                     for i in xrange(d_count)]
-                                    for j in xrange(self.R)]),
+                                     for i in range(d_count)]
+                                    for j in range(self.R)]),
                    'sigma': np.matrix(
-                       np.diag([1.0 for i in xrange(self.R)]))}
+                       np.diag([1.0 for i in range(self.R)]))}
                   for d_count in data_count]
 
         # initializes hyper-parameters
         gamma_alpha = self.gamma_par['a'] + 0.5
         gamma_beta = self.gamma_par['b']
-        eta_alpha = [self.eta_par['a'] + 0.5 for i in xrange(self.R)]
-        eta_beta = [self.eta_par['b'] for i in xrange(self.R)]
+        eta_alpha = [self.eta_par['a'] + 0.5 for i in range(self.R)]
+        eta_beta = [self.eta_par['b'] for i in range(self.R)]
         bw_mu = [0]
-        bw_mu.extend([rnorm(0,1) for i in xrange(self.R)])
-        bw_sigma = np.matrix(np.diag([1 for i in xrange(self.R+1)]))
+        bw_mu.extend([rnorm(0,1) for i in range(self.R)])
+        bw_sigma = np.matrix(np.diag([1 for i in range(self.R+1)]))
 
         # initializes predicted outputs
         f_list = [{'mu': [(abs(rnorm(0,1)) + self.margin)
-                          * np.sign(lbl[i]) for i in xrange(d_count)],
-                   'sigma': [1 for i in xrange(d_count)]}
+                          * np.sign(lbl[i]) for i in range(d_count)],
+                   'sigma': [1 for i in range(d_count)]}
                   for d_count,lbl in zip(data_count, y_list)]
 
         # precomputes kernel crossproducts, initializes lower-upper matrix
         kkt_list = [np.dot(x,x.transpose()) for x in kernel_list]
         lu_list = [{'lower': [-1e40 if y_list[j][i] <= 0 else self.margin
-                              for i in xrange(d_count)],
+                              for i in range(d_count)],
                     'upper': [1e40 if y_list[j][i] >= 0 else -self.margin
-                              for i in xrange(d_count)]}
+                              for i in range(d_count)]}
                    for j,d_count in enumerate(data_count)]
 
         # does inference using variational Bayes for the given number
@@ -215,12 +304,12 @@ class KBTL(object):
         f_dist = 1e10
         while(cur_iter <= self.max_iter and f_dist > self.stopping_tol):
             if verbose and (cur_iter % 10) == 0:
-                print "On iteration " + str(cur_iter) + "...."
-                print "gamma_beta: " + str(round(gamma_beta, 4))
-            for i in xrange(len(X_list)):
+                print(("On iteration " + str(cur_iter) + "...."))
+                print(("gamma_beta: " + str(round(gamma_beta, 4))))
+            for i in range(len(X_list)):
 
                 # updates posterior distributions of projection priors
-                for j in xrange(self.R):
+                for j in range(self.R):
                     lambdas[i]['beta'][:,j] = np.power(
                         (self.lambda_par['b'] ** -1
                          + 0.5 * (
@@ -229,7 +318,7 @@ class KBTL(object):
                          )), -1).transpose()
 
                 # updates posterior distributions of projection matrices
-                for j in xrange(self.R):
+                for j in range(self.R):
                     A_list[i]['sigma'][j,:,:] = np.linalg.inv(
                         np.diag(np.multiply(
                             lambdas[i]['alpha'][:,j],
@@ -246,7 +335,7 @@ class KBTL(object):
 
                 # updates posterior distributions of representations
                 H_list[i]['sigma'] = np.linalg.inv(
-                    np.diag([self.sigma_h ** -2 for r in xrange(self.R)])
+                    np.diag([self.sigma_h ** -2 for r in range(self.R)])
                     + np.outer(bw_mu[1:], bw_mu[1:])
                     + bw_sigma[1:,1:]
                     )
@@ -260,7 +349,7 @@ class KBTL(object):
                         [x*bw_mu[0] + y for x,y in
                          zip(bw_mu[1:],
                              bw_sigma[1:,0].transpose().tolist()[0])]
-                        for c in xrange(data_count[i])]).transpose()
+                        for c in range(data_count[i])]).transpose()
                     )
 
             # updates posterior distributions of classification priors
@@ -278,16 +367,16 @@ class KBTL(object):
             # updates posterior distributions of classification parameters
             # in the shared subspace
             bw_sigma = [self.gamma_par['a'] * self.gamma_par['b']]
-            bw_mu = [0 for r in xrange(self.R+1)]
-            bw_sigma.extend([0 for r in xrange(self.R)])
+            bw_mu = [0 for r in range(self.R+1)]
+            bw_sigma.extend([0 for r in range(self.R)])
             bw_sigma = np.vstack((
                 bw_sigma,
                 np.column_stack(
-                    ([0 for r in xrange(self.R)],
+                    ([0 for r in range(self.R)],
                      np.diag([x*y for x,y in zip(eta_alpha, eta_beta)]))
                     )
                 ))
-            for i in xrange(len(X_list)):
+            for i in range(len(X_list)):
                 bw_sigma += np.vstack(
                     (np.column_stack(
                         (data_count[i],
@@ -309,32 +398,32 @@ class KBTL(object):
 
             # updates posterior distributions of predicted outputs
             f_dist = 0
-            for i in xrange(len(X_list)):
+            for i in range(len(X_list)):
                 f_out = np.dot(
-                    np.vstack(([1 for r in xrange(data_count[i])],
+                    np.vstack(([1 for r in range(data_count[i])],
                                H_list[i]['mu'])).transpose(),
                     bw_mu
                     ).transpose()
                 alpha_norm = (lu_list[i]['lower'] - f_out).tolist()[0]
                 beta_norm = (lu_list[i]['upper'] - f_out).tolist()[0]
-                norm_factor = [norm.cdf(b) - norm.cdf(a) if a != b
+                norm_factor = [stats.norm.cdf(b) - stats.norm.cdf(a) if a != b
                                else 1
                                for a,b in zip(alpha_norm, beta_norm)]
                 old_fpost = {'mu':f_list[i]['mu'],
                              'sigma':f_list[i]['sigma']}
                 f_list[i]['mu'] = [
-                    f + ((norm.pdf(a) - norm.pdf(b)) / n)
+                    f + ((stats.norm.pdf(a) - stats.norm.pdf(b)) / n)
                     for a,b,n,f in
                     zip(alpha_norm, beta_norm,
                         norm_factor, f_out.tolist()[0])
                     ]
                 f_list[i]['sigma'] = [
-                    1 + (a * norm.pdf(a) - b * norm.pdf(b)) / n
-                    - ((norm.pdf(a) - norm.pdf(b)) ** 2) / n**2
+                    1 + (a * stats.norm.pdf(a) - b * stats.norm.pdf(b)) / n
+                    - ((stats.norm.pdf(a) - stats.norm.pdf(b)) ** 2) / n**2
                     for a,b,n in zip(alpha_norm, beta_norm, norm_factor)
                     ]
                 f_dist += np.mean(
-                    [_bhatta_dist(d1, d2)
+                    [bhatta_dist(d1, d2)
                      for d2,d1 in zip(
                          [{'mu':mu2, 'sigma':sigma2} for mu2,sigma2
                           in zip(f_list[i]['mu'], f_list[i]['sigma'])],
@@ -366,19 +455,19 @@ class KBTL(object):
 
         h_mu = [np.dot(a['mu'].transpose(), k)
                 for a,k in zip(self.A, kernel_list)]
-        f_mu = [np.dot(np.vstack(([1 for i in xrange(n)], h)).transpose(),
+        f_mu = [np.dot(np.vstack(([1 for i in range(n)], h)).transpose(),
                        self.bw['mu'])
                 for n,h in zip(data_count, h_mu)]
         f_sigma = [1.0 + np.diag(
             np.dot(
-                np.dot(np.vstack(([1 for i in xrange(n)], h)).transpose(),
+                np.dot(np.vstack(([1 for i in range(n)], h)).transpose(),
                        self.bw['sigma']),
-                np.vstack(([1 for i in xrange(n)], h))
+                np.vstack(([1 for i in range(n)], h))
                 ))
             for n,h in zip(data_count, h_mu)]
 
-        pred_p = [(1-norm.cdf((self.margin-mu) / sigma),
-                   norm.cdf((-self.margin-mu) / sigma))
+        pred_p = [(1-stats.norm.cdf((self.margin-mu) / sigma),
+                   stats.norm.cdf((-self.margin-mu) / sigma))
                   for mu,sigma in zip(f_mu,f_sigma)]
         pred = [(p/(p+n))[0].tolist() for p,n in pred_p]
         return pred
@@ -389,11 +478,11 @@ class KBTL(object):
                       for x,y in zip(y_list, pred_y)]
         return np.mean(auc_scores)
 
-    def get_params(self):
+    def get_params(self, deep=True):
         return {'sigma_h':self.sigma_h}
 
     def set_params(self, **kwargs):
-        for k,v in kwargs.iteritems():
+        for k,v in kwargs.items():
             setattr(self, k, v)
 
 

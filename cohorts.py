@@ -523,7 +523,7 @@ class MultiCohort(object):
             )
 
     def score_multiclf(self,
-                       multiclf, score_indx=tuple(range(16)), tune_indx=None,
+                       multiclf, score_splits=8, tune_splits=None,
                        mtype=None, gene_list=None, exclude_samps=None,
                        final_fit=False, verbose=False):
         """Test a classifier using tuning and cross-validation
@@ -568,28 +568,26 @@ class MultiCohort(object):
             Performance is measured using the area under the receiver operator
             curve metric.
         """
-        if gene_list is None:
-            gene_list = self.train_expr_.columns
-        score_samps = set(self.train_expr_.index)
-        if exclude_samps is not None:
-            score_samps -= set(exclude_samps)
-        if tune_indx is not None:
-            clf = self.tune_clf(clf, tune_indx, mtype,
-                                gene_list, exclude_samps, verbose)
+        samps, genes = self._validate_dims(gene_list=gene_list,
+                                           exclude_samps=exclude_samps)
+        if tune_splits is not None and tune_splits > 0:
+            multiclf = self.tune_multiclf(multiclf, tune_splits, mtype,
+                                          gene_list, exclude_samps, verbose)
             if verbose:
-                print((clf.named_steps['fit']))
-        score_muts = self.train_mut_.status(score_samps, mtype)
-        score_cvs = np.array([
-            (x,y) for x,y in model_selection.StratifiedShuffleSplit(
-                n_splits=max(score_indx)+1, test_size=0.2,
-                random_state=self.intern_cv_).split(
-                    self.train_expr_.loc[score_samps, gene_list], score_muts)
-            ])[score_indx, :]
+                print("Classifier has been tuned to:\n"
+                      + multiclf.named_steps['fit'])
+
+        score_muts = [coh.train_mut_.status(smps, mtype)
+                      for (_,coh), smps in zip(self, samps)]
+        score_cvs = MultiStratifiedShuffleSplit(
+            n_splits=score_splits, test_size=0.2,
+            random_state=self.intern_cv_ % 42949672)
 
         return np.percentile(model_selection.cross_val_score(
-            estimator=clf,
-            X=self.train_expr_.loc[score_samps, gene_list], y=score_muts,
-            scoring=clf.score_auc, cv=score_cvs, n_jobs=16
+            estimator=multiclf,
+            X=[coh.train_expr_.loc[smps, gns]
+               for (_,coh), smps, gns in zip(self, samps, genes)],
+            y=score_muts, scoring=multiclf.score_auc, cv=score_cvs, n_jobs=-1
             ), 25)
 
     def predict_multiclf(self,
