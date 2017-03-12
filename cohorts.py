@@ -8,19 +8,21 @@ testing classifiers.
 
 # Author: Michal Grzadkowski <grzadkow@ohsu.edu>
 
+from data import *
+from mutation import MutLevel, MuTree
+
 import numpy as np
 import pandas as pd
+
+from scipy.stats import fisher_exact
 import random
 
-from data import *
 from sklearn import model_selection
 from sklearn.utils import indexable, check_random_state, safe_indexing
 from sklearn.utils.validation import check_array, _num_samples
 from sklearn.utils.fixes import bincount
-from scipy.stats import fisher_exact
 from sklearn.model_selection._split import (
     BaseShuffleSplit, _validate_shuffle_split, _approximate_mode)
-from mutation import MutLevel, MuTree
 
 
 class Cohort(object):
@@ -109,7 +111,7 @@ class Cohort(object):
                  if a['gene_name'] in expr.columns}
         annot_genes = [a['gene_name'] for g,a in annot.items()]
         expr = expr.loc[:, annot_genes]
-        expr = expr.loc[:,~expr.columns.duplicated()]
+        expr = expr.loc[:, ~expr.columns.duplicated()]
         muts = muts.loc[muts['Sample'].isin(expr.index), :]
         muts = muts.loc[muts['Sample'].isin(cnvs.index), :]
 
@@ -118,6 +120,7 @@ class Cohort(object):
         self.samples = set(muts['Sample']) & set(expr.index) & set(cnvs.index)
         expr = expr.loc[self.samples, :]
         cnvs = cnvs.loc[self.samples, mut_genes]
+        self.cnvs_ = cnvs.copy()
 
         # merges simple somatic mutations with CNV calls
         cnvs['Sample'] = cnvs.index
@@ -158,6 +161,11 @@ class Cohort(object):
             muts=muts, samples=(self.samples - self.train_samps_),
             genes=mut_genes, levels=mut_levels
             )
+
+    def get_cnv_scores(self, samples, gene=None):
+        if gene is None:
+            gene = self.mut_genes[0]
+        return self.cnvs_.loc[samples, gene]
 
     def mutex_test(self, mtype1, mtype2):
         """Checks the mutual exclusivity of two mutation types in the
@@ -280,11 +288,15 @@ class Cohort(object):
             n_splits=score_splits, test_size=0.2,
             random_state=self.intern_cv_)
 
-        return np.percentile(model_selection.cross_val_score(
+        cv_score = np.percentile(model_selection.cross_val_score(
             estimator=clf,
             X=self.train_expr_.loc[samps, genes], y=score_muts,
             scoring=clf.score_auc, cv=score_cvs, n_jobs=-1
             ), 25)
+
+        if final_fit:
+            clf = clf.fit(X=self.train_expr_.loc[samps, genes], y=score_muts)
+        return cv_score
 
     def predict_clf(self,
                     clf, mtype=None, gene_list=None, exclude_samps=None,

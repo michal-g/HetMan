@@ -281,7 +281,7 @@ def get_cnv_firehose(cohort):
 
 
 # .. functions for reading in pathway data ..
-def get_pc2_neighb(gene):
+def get_pc2_neighb(gene, verbose=False):
     """Gets the neighbourhood of a gene as defined by Pathway Commons."""
     pc2 = PathwayCommons(verbose=False)
     pc2.settings.TIMEOUT = 1000
@@ -298,11 +298,10 @@ def get_pc2_neighb(gene):
     # runs the PC2 query, makes sure the output has the correct format
     raw_data = 0
     while isinstance(raw_data, int):
-        print("Reading in Pathway Commons data for gene " + gene + "...")
+        if verbose:
+            print("Reading in Pathway Commons data for gene " + gene + "...")
         raw_data = pc2.http_get(url, frmt=None, params=params)
-        print(type(raw_data))
 
-    print("Moving on...")
     # parses interaction data according to direction
     sif_data = raw_data.splitlines()
     sif_data = [x.split() for x in sif_data]

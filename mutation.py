@@ -7,13 +7,16 @@ formats that facilitate classification of mutation sub-types.
 """
 
 import pandas as pd
-import re
+
+from re import sub as gsub
+from math import log, ceil, exp
 from enum import Enum
+
+from functools import reduce
 from itertools import combinations as combn
 from itertools import groupby, product
-from math import log, ceil, exp
+
 from sklearn.cluster import MeanShift
-from functools import reduce
 
 
 # .. supported mutation levels ..
@@ -125,7 +128,7 @@ class MuTree(object):
         # recursively builds the mutation hierarchy
         muts = MuTree.mut_fxs[self.cur_level](muts)
         self.child = {}
-        for nm,mut in muts.groupby(self.cur_level.name):
+        for nm, mut in muts.groupby(self.cur_level.name):
             next_level = None
             if depth < (len(levels) - 1):
                 for lvl in levels[(depth + 1):]:
@@ -157,7 +160,7 @@ class MuTree(object):
                     new_str = (new_str + ': '
                                + reduce(lambda x,y: x + ',' + y, tuple(v)))
             new_str = new_str + '\n' + '\t'*self.depth
-        new_str = re.sub('\n$', '', new_str)
+        new_str = gsub('\n$', '', new_str)
         return new_str
 
     def __len__(self):
@@ -642,7 +645,7 @@ class MuType(object):
             if v is not None:
                 new_str += ' AND ' + '\n\t' + str(v)
             new_str += '\nOR '
-        return re.sub('\nOR $', '', new_str)
+        return gsub('\nOR $', '', new_str)
 
     def _raw_key(self):
         "Returns the expanded key of a MuType."
