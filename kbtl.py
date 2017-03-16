@@ -11,13 +11,14 @@ detail in http://www.aaai.org/ocs/index.php/AAAI/AAAI14/paper/view/8132.
 
 # Author: Michal Grzadkowski <grzadkow@ohsu.edu>
 
+from classif import PathwaySelect
+
 from random import gauss as rnorm
 from math import log, exp
-import collections
-
 import numpy as np
 from scipy import stats
 
+import collections
 from sklearn import metrics
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import (
@@ -26,7 +27,7 @@ import sklearn.model_selection._validation
 from sklearn.utils import safe_indexing
 
 
-# .. helper functions for use in variational approximation ..
+# .. helper functions for use in transfer learning ..
 def bhatta_dist(dist1, dist2):
     """Calculates Bhattacharyya distance between two normal distributions.
        See https://en.wikipedia.org/wiki/Bhattacharyya_distance for details.
@@ -39,8 +40,11 @@ def bhatta_dist(dist1, dist2):
 
     Returns
     -------
-    D : The distance between the two distributions.
+    D : The distance between the two distributions. Useful for measuring how
+        close the prior distributions of transfer learning parameters are to
+        convergence.
     """
+
     return (0.25 * log(0.25 * ((dist1['sigma'] / dist2['sigma'])
                                + (dist2['sigma'] / dist1['sigma'])
                                + 2.0))
@@ -50,8 +54,11 @@ def bhatta_dist(dist1, dist2):
 
 
 def _safe_split(estimator, X_list, y_list, indx_list, train_indx_list=None):
-    """Overrides sklearn function for use in transfer learning."""
+    """Overrides sklearn function for getting the training split of an input
+       dataset to accomodate transfer learning datasets with multiple tasks.
+    """
 
+    # makes sure kernel matrix is precomputed
     from sklearn.gaussian_process.kernels import Kernel as GPKernel
     if (hasattr(estimator, 'kernel') and callable(estimator.kernel)
         and not isinstance(estimator.kernel, GPKernel)):
@@ -61,6 +68,8 @@ def _safe_split(estimator, X_list, y_list, indx_list, train_indx_list=None):
     X_subset = [[] for _ in X_list]
     y_subset = [[] for _ in y_list]
 
+    # for each transfer task, checks format of task kernel and forms
+    # a training split accordingly
     for i, (X,indices) in enumerate(zip(X_list, indx_list)):
         if not hasattr(X, "shape"):
             if getattr(estimator, "_pairwise", False):
@@ -88,9 +97,10 @@ def _safe_split(estimator, X_list, y_list, indx_list, train_indx_list=None):
     return X_subset, y_subset
 
 
+# .. classes for integrating transfer learning into the sklearn framework ..
 class MultiPipe(Pipeline):
     """A class corresponding to expression-based classifiers of mutation
-       status that use multiple expr-mut datasets.
+       status that use multiple expr-mut datasets ("tasks").
     """
 
     def __init__(self, steps):
@@ -101,6 +111,8 @@ class MultiPipe(Pipeline):
            transform the data, then fit the transformed data using the
            final estimator.
         """
+
+        # parse the passed parameters for each step of the pipeline
         self._validate_steps()
         fit_params_steps = dict((name, {}) for name, step in self.steps
                                 if step is not None)
@@ -108,12 +120,18 @@ class MultiPipe(Pipeline):
             step, param = pname.split('__', 1)
             fit_params_steps[step][param] = pval
         Xt_list = X_list
+        if y_list is None:
+            y_list = [None for _ in X_list]
 
+        # for each transform in the pipeline, split it into a separate
+        # copy for each of the tasks
         for i in range(len(self.steps[:-1])):
             if self.steps[i][1] is not None:
                 self.steps[i] = (self.steps[i][0],
-                                 tuple(type(self.steps[i][1])() for _ in X_list))
+                                 tuple(type(self.steps[i][1])()
+                                       for _ in X_list))
 
+        # apply each transform to each task
         for name, transform in self.steps[:-1]:
             if transform is None:
                 pass
@@ -126,49 +144,62 @@ class MultiPipe(Pipeline):
                     Xt, y, **fit_params_steps[name]).transform(Xt)
                     for i, (Xt,y) in enumerate(zip(Xt_list, y_list))]
 
+        # if we have a final estimator, return its parameters as well
         if self._final_estimator is None:
             return Xt_list, {}
         else:
             return Xt_list, fit_params_steps[self.steps[-1][0]]
 
     def _pretransform(self, X_list):
-        """Applies all of the transforms save the final one."""
+        """Apply all the transformers to each of the tasks."""
         Xt_list = X_list
         for name, transform in self.steps[:-1]:
             if transform is not None:
-                Xt_list = [transform[i].transform(Xt)
-                           for i, Xt in enumerate(Xt_list)]
+                Xt_list = [trx.transform(Xt)
+                           for trx, Xt in zip(transform, Xt_list)]
         return Xt_list
 
     def predict(self, X_list):
         """Apply transforms to the data, and predict
-           with the final estimator
+           with the final estimator.
         """
         Xt_list = self._pretransform(X_list)
         return self.steps[-1][-1].predict(Xt_list)
 
     def predict_proba(self, X_list):
-        """Apply transforms to the data, and predict
-           with the final estimator
+        """Apply transforms to the data, and predict probabilities
+           with the final estimator.
         """
         Xt_list = self._pretransform(X_list)
         return self.steps[-1][-1].predict_proba(Xt_list)
 
     @classmethod
     def score_auc(cls, estimator, expr_list, mut_list):
+        """Scores the predictions made by the classifier
+           across different tasks.
+        """
         mut_scores = estimator.predict_proba(expr_list)
         return np.mean([metrics.roc_auc_score(mut, mut_sc)
                         for mut,mut_sc in zip(mut_list, mut_scores)])
 
-    def tune(self, expr_list, mut_list, cv_samples, test_count=8,
-             update_priors=False, verbose=False):
+    def tune(self, expr_list, mut_list, mut_genes, path_obj,
+             cv_samples, test_count=8, update_priors=False, verbose=False):
+        """Tune the hyperparameters of the classifier using internal
+           cross-validation.
+        """
+
         if self._tune_priors:
+            # get internal splits of the tasks using random sampling
             sklearn.model_selection._validation._safe_split = _safe_split
             grid_test = sklearn.model_selection._search.RandomizedSearchCV(
                 estimator=self, param_distributions=self._tune_priors,
+                fit_params={'feat__mut_genes': mut_genes,
+                            'feat__path_obj': path_obj},
                 n_iter=test_count, scoring=self.score_auc, cv=cv_samples)
-            grid_test.fit(expr_list, mut_list)
 
+            # score the classifier on each combination of split and parameter
+            # value and update the classifier with the best values
+            grid_test.fit(expr_list, mut_list)
             tune_scores = (grid_test.cv_results_['mean_test_score']
                            - grid_test.cv_results_['std_test_score'])
             self.set_params(
@@ -182,13 +213,15 @@ class MultiClf(MultiPipe):
        status that use multiple expr-mut datasets.
     """
 
-    def __init__(self, mut_genes=None, expr_genes=None):
+    def __init__(self, path_keys=None):
         self._tune_priors = {
             'fit__sigma_h': stats.lognorm(scale=exp(-1), s=exp(1))}
+        feat_step = PathwaySelect(path_keys=path_keys)
         norm_step = StandardScaler()
         fit_step = KBTL()
         MultiPipe.__init__(self,
-            [('norm', norm_step), ('fit', fit_step)])
+            [('feat', feat_step), ('norm', norm_step), ('fit', fit_step)])
+        self.set_params(path_keys=path_keys)
 
 
 # .. transfer learning classifiers ..
@@ -376,6 +409,7 @@ class KBTL(object):
                      np.diag([x*y for x,y in zip(eta_alpha, eta_beta)]))
                     )
                 ))
+
             for i in range(len(X_list)):
                 bw_sigma += np.vstack(
                     (np.column_stack(
@@ -393,6 +427,7 @@ class KBTL(object):
                               H_list[i]['mu'])),
                     f_list[i]['mu']
                     )
+
             bw_sigma = np.matrix(np.linalg.inv(bw_sigma))
             bw_mu = np.dot(bw_sigma, bw_mu.transpose())
 

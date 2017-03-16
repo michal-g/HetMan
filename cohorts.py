@@ -14,6 +14,7 @@ from mutation import MutLevel, MuTree
 import numpy as np
 import pandas as pd
 
+from functools import reduce
 from scipy.stats import fisher_exact
 import random
 
@@ -23,6 +24,23 @@ from sklearn.utils.validation import check_array, _num_samples
 from sklearn.utils.fixes import bincount
 from sklearn.model_selection._split import (
     BaseShuffleSplit, _validate_shuffle_split, _approximate_mode)
+
+
+# .. helper functions ..
+def _safe_load_path(genes):
+    """Loads in pathway data from API or local source as available."""
+    try:
+        pathways = {gn:get_pc2_neighb(gn) for gn in genes}
+    except HetManDataError:
+        print("Defaulting to pathway data stored on file...")
+        pathways = parse_sif(genes, get_sif_neighb(
+            '/home/users/grzadkow/compbio/input-data/'
+            'babur-mutex/data-tcga/Network.sif'))
+
+    return pathways
+
+class HetManMutError(Exception):
+    pass
 
 
 class Cohort(object):
@@ -73,7 +91,7 @@ class Cohort(object):
                        include_samps=None, exclude_samps=None,
                        gene_list=None):
         if include_samps is not None and exclude_samps is not None:
-            raise HetmanDataError("Cannot specify samples to be included and"
+            raise HetManMutError("Cannot specify samples to be included and"
                                   "samples to be excluded at the same time!")
         elif include_samps is not None:
             samps = self.train_samps_ & set(include_samps)
@@ -88,19 +106,22 @@ class Cohort(object):
         return samps, genes
 
     def __init__(self,
-                 syn, cohort, mut_genes,
-                 mut_levels=('Gene', 'Form', 'Protein'), cv_info=None):
+                 syn, cohort, mut_genes, mut_levels=('Gene', 'For`m'),
+                 load_path=True, cv_info=None):
         self.cohort_ = cohort
         if cv_info is None:
             cv_info = {'Prop': 2.0/3, 'Seed':1}
         self.intern_cv_ = cv_info['Seed'] ** 2
         self.mut_genes = mut_genes
 
-        # loads gene expression and mutation data
+        # loads gene expression and mutation data, as well as pathway
+        # neighbourhood for mutated genes
         annot = get_annot()
         expr = get_expr_firehose(cohort)
         muts = get_mut_mc3(syn, list(set(mut_levels) - set(['GISTIC'])))
         cnvs = get_cnv_firehose(cohort)
+        if load_path:
+            self.path_ = _safe_load_path(mut_genes)
 
         # filters out genes that are not expressed in any samples, don't have
         # any variation across the samples, are not included in the
@@ -137,8 +158,8 @@ class Cohort(object):
                              'Start':a['Start'], 'End':a['End']}
                       for g,a in annot.items() for mut_g in mut_genes
                       if a['gene_name'] == mut_g}
-        annot_ids = {k:v['ID'] for k,v in annot_data.items()}
         self.annot = annot
+        self.mut_annot = annot_data
 
         # gets subset of samples to use for training
         random.seed(a=cv_info['Seed'])
@@ -184,7 +205,7 @@ class Cohort(object):
         samps1 = mtype1.get_samples(self.train_mut_)
         samps2 = mtype2.get_samples(self.train_mut_)
         if not samps1 or not samps2:
-            raise HetmanDataError("Both sets must be non-empty!")
+            raise HetManMutError("Both sets must be non-empty!")
         all_samps = set(self.train_expr_.index)
         both_samps = samps1 & samps2
         _,pval = fisher_exact(
@@ -226,7 +247,10 @@ class Cohort(object):
             random_state=(self.intern_cv_ ** 2) % 42949672)
 
         return clf.tune(expr=self.train_expr_.loc[samps, genes],
-                        mut=tune_muts, cv_samples=tune_cvs, verbose=verbose)
+                        mut=tune_muts, path_obj=self.path_,
+                        mut_genes=list(
+                            reduce(lambda x,y: x|y, mtype.child.keys())),
+                        cv_samples=tune_cvs, verbose=verbose)
 
     def score_clf(self,
                   clf, score_splits=8, tune_splits=None,
@@ -289,13 +313,16 @@ class Cohort(object):
             random_state=self.intern_cv_)
 
         cv_score = np.percentile(model_selection.cross_val_score(
-            estimator=clf,
-            X=self.train_expr_.loc[samps, genes], y=score_muts,
+            estimator=clf, X=self.train_expr_.loc[samps, genes], y=score_muts,
+            fit_params={'feat__mut_genes': list(
+                reduce(lambda x,y: x|y, mtype.child.keys())),
+                        'feat__path_obj': self.path_},
             scoring=clf.score_auc, cv=score_cvs, n_jobs=-1
             ), 25)
 
         if final_fit:
-            clf = clf.fit(X=self.train_expr_.loc[samps, genes], y=score_muts)
+            clf = clf.fit(X=self.train_expr_.loc[samps, genes], y=score_muts,
+                          path_obj=self.path_)
         return cv_score
 
     def predict_clf(self,
@@ -462,7 +489,7 @@ class MultiCohort(object):
                        include_samps=None, exclude_samps=None,
                        gene_list=None):
         if include_samps is not None and exclude_samps is not None:
-            raise HetmanDataError("Cannot specify samples to be included and"
+            raise HetManMutError("Cannot specify samples to be included and"
                                   "samples to be excluded at the same time!")
         elif include_samps is not None:
             samps = [coh.train_samps_ & set(inc_samps)
@@ -480,13 +507,16 @@ class MultiCohort(object):
         return samps, genes
 
     def __init__(self,
-                 syn, cohorts, mut_genes,
-                 mut_levels=('Gene', 'Form', 'Protein'), cv_info=None):
+                 syn, cohorts, mut_genes, mut_levels=('Gene', 'Form'),
+                 load_path=True, cv_info=None):
         if cv_info is None:
             cv_info = {'Prop': 2.0/3, 'Seed':1}
         self.intern_cv_ = cv_info['Seed'] ** 2
+        if load_path:
+            self.path_ = _safe_load_path(mut_genes)
         self.cohorts_ = dict(
-            (cohort, Cohort(syn, cohort, mut_genes, mut_levels, cv_info))
+            (cohort, Cohort(syn, cohort, mut_genes, mut_levels,
+                            cv_info=cv_info, load_path=False))
             for cohort in cohorts)
 
     def __iter__(self):
@@ -531,7 +561,9 @@ class MultiCohort(object):
         return multiclf.tune(
             expr_list=[coh.train_expr_.loc[smps, gns]
                        for (_,coh), smps, gns in zip(self, samps, genes)],
-            mut_list=tune_muts, cv_samples=tune_cvs, verbose=verbose
+            mut_list=tune_muts, cv_samples=tune_cvs, path_obj=self.path_,
+            mut_genes=list(reduce(lambda x,y: x|y, mtype.child.keys())),
+            verbose=verbose
             )
 
     def score_multiclf(self,
@@ -599,7 +631,11 @@ class MultiCohort(object):
             estimator=multiclf,
             X=[coh.train_expr_.loc[smps, gns]
                for (_,coh), smps, gns in zip(self, samps, genes)],
-            y=score_muts, scoring=multiclf.score_auc, cv=score_cvs, n_jobs=-1
+            y=score_muts, fit_params={
+                'feat__mut_genes': list(reduce(lambda x,y: x|y,
+                                               mtype.child.keys())),
+                'feat__path_obj': self.path_},
+            scoring=multiclf.score_auc, cv=score_cvs, n_jobs=-1
             ), 25)
 
     def predict_multiclf(self,

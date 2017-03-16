@@ -158,50 +158,49 @@ class PathwaySelect(SelectorMixin):
        in Pathway Commons pathways.
     """
 
-    def __init__(self, path_gene, path_keys=None):
-        self.path_gene = path_gene
+    def __init__(self, path_keys=None):
         self.path_keys = path_keys
         super(PathwaySelect, self).__init__()
 
     def fit(self, X, y, **fit_params):
+        mut_genes = fit_params['mut_genes']
         if self.path_keys is None:
             self.select_genes = set(X.columns)
         else:
-            self.path_obj = get_pc2_neighb(self.path_gene)
-            if self.path_keys is None:
-                select_genes = set(chain(*chain(
-                    *[[g for t,g in v.items()]
-                      for v in self.path_obj.values()])))
-            else:
-                select_genes = set()
+            path_obj = fit_params['path_obj']
+            select_genes = set()
+            for gene in mut_genes:
                 for pdirs, ptypes in self.path_keys:
                     if len(pdirs) == 0:
                         select_genes |= set(chain(*chain(
                             *[[g for t,g in v.items() if t in ptypes]
-                            for v in self.path_obj.values()]
+                            for v in path_obj[gene].values()]
                             )))
                     elif len(ptypes) == 0:
                         select_genes |= set(chain(*chain(
-                            *[v.values() for k,v in self.path_obj.items()
+                            *[v.values() for k,v in path_obj[gene].items()
                             if k in pdirs]
                             )))
                     else:
                         select_genes |= set(chain(*chain(
                             *[[g for t,g in v.items() if t in ptypes]
-                            for k,v in self.path_obj.items() if k in pdirs]
+                            for k,v in path_obj[gene].items() if k in pdirs]
                             )))
             self.select_genes = select_genes
 
-        self.select_genes -= set([self.path_gene])
+        self.select_genes -= set(mut_genes)
         self.expr_genes = X.columns
         return self
 
     def _get_support_mask(self):
         return np.array([g in self.select_genes for g in self.expr_genes])
+    
+    def set_params(self, **kwargs):
+        for k,v in kwargs.items():
+            setattr(self, k, v)
 
     def get_params(self, deep=True):
-        return {'path_gene': self.path_gene,
-                'path_keys': self.path_keys}
+        return {'path_keys': self.path_keys}
 
 
 class UniPipe(Pipeline):
@@ -257,16 +256,18 @@ class UniPipe(Pipeline):
         mut_scores = estimator.prob_mut(expr)
         return roc_auc_score(mut, mut_scores)
 
-    def tune(self, expr, mut, cv_samples, test_count=16,
-             update_priors=False, verbose=False):
+    def tune(self, expr, mut, mut_genes, path_obj, cv_samples,
+             test_count=16, update_priors=False, verbose=False):
         """Tunes the classifier by sampling over the parameter space and
            choosing the parameters with the best 25th percentile.
         """
         if self._tune_priors:
             grid_test = RandomizedSearchCV(
                 estimator=self, param_distributions=self._tune_priors,
-                n_iter=test_count, scoring=self.score_auc, cv=cv_samples,
-                n_jobs=-1, refit=False
+                fit_params={'feat__mut_genes': mut_genes,
+                            'feat__path_obj': path_obj},
+                n_iter=test_count, scoring=self.score_auc,
+                cv=cv_samples, n_jobs=-1, refit=False
                 )
             grid_test.fit(expr, mut)
 
@@ -316,13 +317,14 @@ class NaiveBayes(UniPipe):
        of mutation status.
     """
 
-    def __init__(self, mut_gene=None, path_keys=None):
+    def __init__(self, path_keys=None):
         self._tune_priors = {}
-        feat_step = PathwaySelect(path_gene=mut_gene, path_keys=path_keys)
+        feat_step = PathwaySelect(path_keys=path_keys)
         norm_step = StandardScaler()
         fit_step = GaussianNB()
         UniPipe.__init__(self,
             [('feat', feat_step), ('norm', norm_step), ('fit', fit_step)])
+        self.set_params(path_keys=path_keys)
 
 
 class Lasso(UniPipe):
@@ -330,15 +332,16 @@ class Lasso(UniPipe):
        of mutation status with the lasso regularization penalty.
     """
 
-    def __init__(self, mut_gene=None, path_keys=None):
+    def __init__(self, path_keys=None):
         self._tune_priors = {
             'fit__C':stats.lognorm(scale=exp(-1), s=exp(1))}
-        feat_step = PathwaySelect(path_gene=mut_gene, path_keys=path_keys)
+        feat_step = PathwaySelect(path_keys=path_keys)
         norm_step = StandardScaler()
         fit_step = LogisticRegression(
             penalty='l1', tol=1e-2, class_weight='balanced')
         UniPipe.__init__(self,
             [('feat', feat_step), ('norm', norm_step), ('fit', fit_step)])
+        self.set_params(path_keys=path_keys)
 
 
 class LogReg(UniPipe):
@@ -378,17 +381,18 @@ class SVCrbf(UniPipe):
        of mutation status with a radial basis kernel.
     """
    
-    def __init__(self, mut_gene=None, path_keys=None):
+    def __init__(self, path_keys=None):
         self._tune_priors = {
             'fit__C':stats.lognorm(scale=exp(-1), s=exp(1)),
             'fit__gamma':stats.lognorm(scale=1e-5, s=exp(2))}
-        feat_step = PathwaySelect(path_gene=mut_gene, path_keys=path_keys)
+        feat_step = PathwaySelect(path_keys=path_keys)
         norm_step = StandardScaler()
         fit_step = SVC(
             kernel='rbf', probability=True, class_weight='balanced',
             cache_size=500)
         UniPipe.__init__(self,
             [('feat', feat_step), ('norm', norm_step), ('fit', fit_step)])
+        self.set_params(path_keys=path_keys)
 
 
 class rForest(UniPipe):
@@ -396,16 +400,17 @@ class rForest(UniPipe):
        of mutation status.
     """
 
-    def __init__(self, mut_gene=None, path_keys=None):
+    def __init__(self, path_keys=None):
         self._tune_priors = {
-            'fit__max_features':[0.01,0.02,0.05,0.1,0.2],
-            'fit__min_samples_leaf':[0.0001,0.02,0.04,0.06]}
-        feat_step = PathwaySelect(path_gene=mut_gene, path_keys=path_keys)
+            'fit__max_features':[0.005,0.01,0.02,0.04,0.08,0.15],
+            'fit__min_samples_leaf':[0.0001,0.01,0.05]}
+        feat_step = PathwaySelect(path_keys=path_keys)
         norm_step = StandardScaler()
         fit_step = RandomForestClassifier(
                     n_estimators=500, class_weight='balanced')
         UniPipe.__init__(self,
             [('feat', feat_step), ('norm', norm_step), ('fit', fit_step)])
+        self.set_params(path_keys=path_keys)
 
 
 class KNeigh(UniPipe):
@@ -513,6 +518,8 @@ class SVCpcRS(UniPipe):
 
 
 class PCdir(BaseSVC):
+    """A classifier that forms a kernel based on gene pathway presence.
+    """
    
     def _weight_eucl(self, x, y, weights=None):
         if weights is None:
@@ -746,16 +753,14 @@ class PCpipe(UniPipe):
     """A class corresponding to
     """
 
-    def __init__(self, mut_genes):
+    def __init__(self, path_keys=None):
         self._tune_priors = {}
-        path_obj = list(read_sif(mut_genes).values())[0]
-        self.path_obj = {k:v for k,v in list(path_obj.items()) if k =='out'}
-        self.mut_genes = mut_genes
-        feat_step = PathwaySelect(self.path_obj)
-        norm_step = RobustScaler()
+        feat_step = PathwaySelect(path_keys=path_keys)
+        norm_step = StandardScaler()
         fit_step = PCdir()
         UniPipe.__init__(self,
             [('feat', feat_step), ('norm', norm_step), ('fit', fit_step)])
+        self.set_params(path_keys=path_keys)
 
 
 class PCgbc(UniPipe):

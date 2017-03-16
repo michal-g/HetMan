@@ -17,12 +17,17 @@ from re import sub as gsub
 from itertools import groupby
 from functools import reduce
 from bioservices import PathwayCommons 
+from time import sleep
 
 
 # .. directories containing raw -omics data and cross-validation samples ..
 _base_dir = '/home/users/grzadkow/compbio/'
 _icgc_dir = _base_dir + 'input-data/ICGC/raw/'
 _cv_dir = _base_dir + 'auxiliary/HetMan/cv-samples/'
+
+
+class HetManDataError(Exception):
+    pass
 
 
 # .. helper functions for parsing -omic datasets ..
@@ -282,50 +287,49 @@ def get_cnv_firehose(cohort):
 
 # .. functions for reading in pathway data ..
 def get_pc2_neighb(gene, verbose=False):
-    """Gets the neighbourhood of a gene as defined by Pathway Commons."""
-    pc2 = PathwayCommons(verbose=False)
+    """Downloads Pathway Commons neighbourhood for a given gene using
+       the PC API.
+    """
+    pc2 = PathwayCommons(verbose=verbose)
     pc2.settings.TIMEOUT = 1000
     neighb = {}
 
-    # sets the parameters of the PC2 query
-    url = 'graph'
-    gene_id = pc2.idmapping(gene)[gene]
-    params = {'format': 'BINARY_SIF',
-              'kind': 'neighborhood',
-              'limit': 1,
-              'source': 'http://identifiers.org/uniprot/' + gene_id}
-
     # runs the PC2 query, makes sure the output has the correct format
     raw_data = 0
-    while isinstance(raw_data, int):
+    i = 0
+    while isinstance(raw_data, int) and i < 5:
         if verbose:
-            print("Reading in Pathway Commons data for gene " + gene + "...")
-        raw_data = pc2.http_get(url, frmt=None, params=params)
+            print("Reading in Pathway Commons data for gene "
+                  + gene + "...")
+        # sets the parameters of the PC2 query
+        url = 'graph'
+        try:
+            gene_id = pc2.idmapping(gene)[gene]
+            params = {'format': 'BINARY_SIF',
+                      'kind': 'neighborhood',
+                      'limit': 1,
+                      'source': ('http://identifiers.org/uniprot/'
+                                 + gene_id)
+                     }
+            raw_data = pc2.http_get(url, frmt=None, params=params)
+
+        except:
+            if verbose:
+                print("Reading in PC data failed for gene "
+                      + gene + ", trying again...")
+            i += 1
+            sleep(5)
+
+    if isinstance(raw_data, int):
+        raise HetManDataError("Could not access PC2 API!")
 
     # parses interaction data according to direction
     sif_data = raw_data.splitlines()
     sif_data = [x.split() for x in sif_data]
-    up_neighbs = sorted([(x[1], x[0]) for x in sif_data if x[2] == gene],
-                        key=lambda x: x[0])
-    down_neighbs = sorted([(x[1], x[2]) for x in sif_data if x[0] == gene],
-                          key=lambda x: x[0])
-    other_neighbs = sorted([x for x in sif_data
-                            if x[0] != gene and x[2] != gene],
-                           key=lambda x: x[1])
-
-    # parses according to interaction type
-    neighb['Up'] = {k:[x[1] for x in v] for k,v in
-                    groupby(up_neighbs, lambda x: x[0])}
-    neighb['Down'] = {k:[x[1] for x in v] for k,v in
-                      groupby(down_neighbs, lambda x: x[0])}
-    neighb['Other'] = {k:[(x[0],x[2]) for x in v] for k,v in
-                       groupby(other_neighbs, lambda x: x[1])}
-
-    return neighb
+    return sif_data
 
 
-def read_sif(mut_genes,
-             sif_file='input-data/babur-mutex/data-tcga/Network.sif'):
+def get_sif_neighb(sif_file):
     """Gets the edges containing at least one of given genes from a SIF
        pathway file and arranges them according to the direction of the
        edge and the type of interaction it represents.
@@ -344,25 +348,40 @@ def read_sif(mut_genes,
     link_data : dict
         A list of the interactions that involve one of the given genes.
     """
-    if isinstance(mut_genes, str):
-        mut_genes = [mut_genes]
-    sif_dt = np.dtype(
-        [('Gene1', np.str_, 16),
-         ('Type', np.str_, 32),
-         ('Gene2', np.str_, 16)])
-    sif_data = np.loadtxt(
-        fname = _base_dir + sif_file, dtype = sif_dt, delimiter = '\t')
-    link_data = {g:{'in':None, 'out':None} for g in mut_genes}
+    sif_dt = np.dtype([('UpGene', '|S16'),
+                       ('Type', '|S32'),
+                       ('DownGene', '|S16')])
+    sif_data = np.genfromtxt(fname=sif_file, dtype=sif_dt, delimiter='\t')
+    return sif_data
 
+
+def parse_sif(mut_genes, sif_data):
+    """Parses a sif dataset to get the pathway neighbours of a given gene.
+    """
+    neighb = {}
     for gene in mut_genes:
-        in_data = np.sort(sif_data[sif_data['Gene2'] == gene],
-                          order='Type')
-        out_data = np.sort(sif_data[sif_data['Gene1'] == gene],
-                           order='Type')
-        link_data[gene]['in'] = {k:[x['Gene1'] for x in v] for k,v in
-                                 groupby(in_data, lambda x: x['Type'])}
-        link_data[gene]['out'] = {k:[x['Gene2'] for x in v] for k,v in
-                                  groupby(out_data, lambda x: x['Type'])}
-    return link_data
+        neighb[gene] = {}
+
+        up_neighbs = sorted([(x['Type'].decode(), x['UpGene'].decode())
+                             for x in sif_data
+                             if x['DownGene'].decode() == gene],
+                            key=lambda x: x[0])
+        down_neighbs = sorted([(x['Type'].decode(), x['DownGene'].decode())
+                               for x in sif_data
+                               if x['UpGene'].decode() == gene],
+                              key=lambda x: x[0])
+        #other_neighbs = sorted([x for x in sif_data
+        #                        if x[0] != gene and x[2] != gene],
+        #                       key=lambda x: x[1])
+        
+        # parses according to interaction type
+        neighb[gene]['Up'] = {k:[x[1] for x in v] for k,v in
+                              groupby(up_neighbs, lambda x: x[0])}
+        neighb[gene]['Down'] = {k:[x[1] for x in v] for k,v in
+                                groupby(down_neighbs, lambda x: x[0])}
+        #neighb[gene]['Other'] = {k:[(x[0],x[2]) for x in v] for k,v in
+        #                         groupby(other_neighbs, lambda x: x[1])}
+
+    return neighb
 
 
