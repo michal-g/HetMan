@@ -19,6 +19,7 @@ from scipy.stats import fisher_exact
 import random
 
 from sklearn import model_selection
+from sklearn.metrics import roc_auc_score
 from sklearn.utils import indexable, check_random_state, safe_indexing
 from sklearn.utils.validation import check_array, _num_samples
 from sklearn.utils.fixes import bincount
@@ -89,17 +90,22 @@ class Cohort(object):
 
     def _validate_dims(self, 
                        include_samps=None, exclude_samps=None,
-                       gene_list=None):
+                       gene_list=None, use_test=False):
         if include_samps is not None and exclude_samps is not None:
             raise HetManMutError("Cannot specify samples to be included and"
                                   "samples to be excluded at the same time!")
-        elif include_samps is not None:
-            samps = self.train_samps_ & set(include_samps)
-        elif exclude_samps is not None:
-            samps = self.train_samps_ - set(exclude_samps)
+
+        if use_test:
+            samps = self.test_samps_
+            genes = set(self.test_expr_.columns)
         else:
             samps = self.train_samps_
-        genes = set(self.train_expr_.columns)
+            genes = set(self.train_expr_.columns)
+
+        if include_samps is not None:
+            samps &= set(include_samps)
+        elif exclude_samps is not None:
+            samps -= set(exclude_samps)
         if gene_list is not None:
             genes &= set(gene_list)
 
@@ -138,7 +144,8 @@ class Cohort(object):
 
         # gets set of samples shared across expression and mutation datasets,
         # subsets these datasets to use only these samples
-        self.samples = set(muts['Sample']) & set(expr.index) & set(cnvs.index)
+        self.samples = frozenset(
+            set(muts['Sample']) & set(expr.index) & set(cnvs.index))
         expr = expr.loc[self.samples, :]
         cnvs = cnvs.loc[self.samples, mut_genes]
         self.cnvs_ = cnvs.copy()
@@ -168,20 +175,15 @@ class Cohort(object):
             random.sample(population=self.samples,
                           k=int(round(len(self.samples) * cv_info['Prop'])))
             )
+        self.test_samps_ = self.samples - self.train_samps_
 
         # creates training and testing expression and mutation datasets
-        self.train_expr_ = log_norm_expr(
-            expr.loc[self.train_samps_, :])
-        self.test_expr_ = log_norm_expr(
-            expr.loc[self.samples - self.train_samps_, :])
-        self.train_mut_ = MuTree(
-            muts=muts, samples=self.train_samps_,
-            genes=mut_genes, levels=mut_levels
-            )
-        self.test_mut_ = MuTree(
-            muts=muts, samples=(self.samples - self.train_samps_),
-            genes=mut_genes, levels=mut_levels
-            )
+        self.train_expr_ = log_norm_expr(expr.loc[self.train_samps_, :])
+        self.test_expr_ = log_norm_expr(expr.loc[self.test_samps_, :])
+        self.train_mut_ = MuTree(muts=muts, samples=self.train_samps_,
+                                 genes=mut_genes, levels=mut_levels)
+        self.test_mut_ = MuTree(muts=muts, samples=self.test_samps_,
+                                genes=mut_genes, levels=mut_levels)
 
     def get_cnv_scores(self, samples, gene=None):
         if gene is None:
@@ -216,8 +218,31 @@ class Cohort(object):
             alternative='less')
         return pval
 
+    def fit_clf(self, clf, mtype=None, gene_list=None, exclude_samps=None):
+        """Fits a classifier."""
+        samps, genes = self._validate_dims(exclude_samps=exclude_samps,
+                                           gene_list=gene_list)
+        fit_muts = self.train_mut_.status(samps, mtype)
+        return clf.fit(X=self.train_expr_.loc[samps, genes], y=fit_muts,
+                       feat__mut_genes=list(
+                           reduce(lambda x,y: x|y, mtype.child.keys())),
+                       feat__path_obj=self.path_)
+
+    def predict_clf(self,
+                    clf, use_test=False, gene_list=None, exclude_samps=None):
+        """Predicts mutation status using a classifier."""
+        samps, genes = self._validate_dims(exclude_samps=exclude_samps,
+                                           gene_list=gene_list,
+                                           use_test=use_test)
+        if use_test:
+            probs = clf.prob_mut(expr=self.test_expr_.loc[samps, genes])
+        else:
+            probs = clf.prob_mut(expr=self.train_expr_.loc[samps, genes])
+
+        return probs
+
     def tune_clf(self,
-                 clf, tune_splits=2, mtype=None,
+                 clf, mtype=None, tune_splits=2, test_count=16,
                  gene_list=None, exclude_samps=None, verbose=False):
         """Tunes a classifier using cross-validation within the training
            samples of this dataset.
@@ -250,12 +275,12 @@ class Cohort(object):
                         mut=tune_muts, path_obj=self.path_,
                         mut_genes=list(
                             reduce(lambda x,y: x|y, mtype.child.keys())),
-                        cv_samples=tune_cvs, verbose=verbose)
+                        test_count=test_count, cv_samples=tune_cvs,
+                        verbose=verbose)
 
     def score_clf(self,
-                  clf, score_splits=8, tune_splits=None,
-                  mtype=None, gene_list=None, exclude_samps=None,
-                  final_fit=False, verbose=False):
+                  clf, mtype=None, score_splits=16, gene_list=None,
+                  exclude_samps=None, verbose=False):
         """Test a classifier using tuning and cross-validation
            within the training samples of this dataset.
 
@@ -267,22 +292,6 @@ class Cohort(object):
         mtype : MuType, optional
             The mutation sub-type to test the classifier on.
             Default is to use all of the mutations available.
-
-        test_indx : list of ints, optional
-            Which of the internal cross-validation samples to use for testing
-            classifier performance.
-
-        tune_indx : list of ints, optional
-            Which of the internal cross-validation samples to use for tuning
-            the hyper-parameters of the given classifier.
-            Default is to not do any tuning and thus use the default
-            hyper-parameter settings.
-
-        final_fit : boolean
-            Whether or not to fit the given classifier to all of the training
-            data after tuning and testing is complete. Useful if, for
-            instance, we want to learn about the coefficients of this
-            classifier when predicting the given set of mutations.
 
         verbose : boolean
             Whether or not the classifier should print information about the
@@ -300,13 +309,6 @@ class Cohort(object):
         """
         samps, genes = self._validate_dims(exclude_samps=exclude_samps,
                                            gene_list=gene_list)
-        if tune_splits is not None and tune_splits > 0:
-            clf = self.tune_clf(clf, tune_splits, mtype,
-                                gene_list, exclude_samps, verbose)
-            if verbose:
-                print("Classifier has been tuned to:\n"
-                      + clf.named_steps['fit'])
-
         score_muts = self.train_mut_.status(samps, mtype)
         score_cvs = model_selection.StratifiedShuffleSplit(
             n_splits=score_splits, test_size=0.2,
@@ -320,125 +322,17 @@ class Cohort(object):
             scoring=clf.score_auc, cv=score_cvs, n_jobs=-1
             ), 25)
 
-        if final_fit:
-            clf = clf.fit(X=self.train_expr_.loc[samps, genes], y=score_muts,
-                          path_obj=self.path_)
         return cv_score
 
-    def predict_clf(self,
-                    clf, mtype=None, gene_list=None, exclude_samps=None,
-                    pred_indx=tuple(range(16)), tune_indx=None,
-                    final_fit=False, verbose=False):
-        """Test a classifier using tuning and cross-validation
-           within the training samples of this dataset.
+    def eval_clf(self, clf, mtype=None, gene_list=None, exclude_samps=None):
+        """Evaluate the performance of a classifier."""
+        samps, genes = self._validate_dims(exclude_samps=exclude_samps,
+                                           gene_list=gene_list, use_test=True)
+        probs = self.predict_clf(clf, use_test=True, gene_list=gene_list,
+                                 exclude_samps=exclude_samps)
+        eval_muts = self.test_mut_.status(samps, mtype)
 
-        Parameters
-        ----------
-        clf : UniClassifier
-            An instnce of the classifier to test.
-
-        mtype : MuType, optional
-            The mutation sub-type to test the classifier on.
-            Default is to use all of the mutations available.
-
-        test_indx : list of ints, optional
-            Which of the internal cross-validation samples to use for testing
-            classifier performance.
-
-        tune_indx : list of ints, optional
-            Which of the internal cross-validation samples to use for tuning
-            the hyper-parameters of the given classifier.
-            Default is to not do any tuning and thus use the default
-            hyper-parameter settings.
-
-        final_fit : boolean
-            Whether or not to fit the given classifier to all of the training
-            data after tuning and testing is complete. Useful if, for
-            instance, we want to learn about the coefficients of this
-            classifier when predicting the given set of mutations.
-
-        verbose : boolean
-            Whether or not the classifier should print information about the
-            optimal hyper-parameters found during tuning.
-
-        Returns
-        -------
-        P : float
-            The 1st quartile of tuned classifier performance across the
-            cross-validation samples. Used instead of the mean of performance
-            to take into account performance variation for "hard" samples.
-
-            Performance is measured using the area under the receiver operator
-            curve metric.
-        """
-        if gene_list is None:
-            gene_list = self.train_expr_.columns
-        if exclude_samps is not None:
-            ex_indx = np.array(range(self.train_expr_.shape[0]))
-            ex_indx = set(ex_indx[self.train_expr_.index.isin(exclude_samps)])
-        else:
-            ex_indx = set()
-
-        if tune_indx is not None:
-            clf = self.tune_clf(clf, tune_indx, mtype,
-                                gene_list, exclude_samps, verbose)
-            if verbose:
-                print(clf.named_steps['fit'])
-
-        pred_muts = self.train_mut_.status(self.train_expr_.index, mtype)
-        pred_scores = np.zeros((self.train_expr_.shape[0], 1))
-        for pred_i in pred_indx:
-            pred_seed = (self.intern_cv_ ** pred_i) % 4294967293
-            pred_cvs = [
-                (list(set(tr) - ex_indx), tst)
-                for tr,tst in model_selection.StratifiedKFold(
-                    n_splits=5, shuffle=True,
-                    random_state=pred_seed).split(
-                        self.train_expr_.loc[:, gene_list], pred_muts)
-                ]
-            pred_scores += model_selection.cross_val_predict(
-                estimator=clf,
-                X=self.train_expr_.loc[:, gene_list], y=pred_muts,
-                method='prob_mut', cv=pred_cvs, n_jobs=16
-                ) / len(pred_indx)
-
-        pred_scores = pd.Series(pred_scores.tolist(), dtype=np.float)
-        pred_scores.index = self.train_expr_.index
-        return pred_scores
-
-    def test_clf(self,
-                 clf, mtype=None, tune_indx=None,
-                 gene_list=None, verbose=False):
-        """Test a classifier using by tuning within the training samples,
-           training on all of them, and then testing on the testing samples.
-
-        Parameters
-        ----------
-        classif : MutClassifier
-            The classifier to test.
-
-        mtype : MuType, optional
-            The mutation sub-type to test the classifier on.
-            Default is to use all of the mutations available.
-
-        tune_indx : list of ints, optional
-            Which of the internal cross-validation samples to use for tuning
-            the hyper-parameters of the given classifier.
-
-        Returns
-        -------
-        P : float
-            Performance of the classifier on the testing samples as measured
-            using the AUC ROC metric.
-        """
-        train_expr,train_mut,train_cv = self.training(mtype)
-        test_expr,test_mut = self.testing(mtype)
-        if tune_indx is not None:
-            tune_cvs = [x for i,x in enumerate(train_cv)
-                        if i in tune_indx]
-            classif.tune(train_expr, train_mut, tune_cvs)
-        clf.fit(train_expr, train_mut)
-        return clf.score_auc(clf, test_expr, test_mut)
+        return roc_auc_score(eval_muts, probs)
 
 
 class MultiCohort(object):

@@ -7,6 +7,9 @@ import sys
 
 sys.path += ['/home/users/grzadkow/compbio/scripts/HetMan']
 from mutation import *
+from cohorts import Cohort
+import classif
+
 from itertools import combinations as combn
 
 
@@ -37,6 +40,11 @@ def mtypes_small():
     mtype4 = MuType({('Form', 'Silent'): None})
     mtype5 = MuType({('Gene', ('CDH1','TTN')): None})
     return [mtype1, mtype2, mtype3, mtype4, mtype5]
+
+@pytest.fixture(scope='module')
+def cdata_small():
+    return Cohort(syn, cohort='COAD', mut_genes=['BRAF','TP53','PIK3CA'],
+                  mut_levels=('Gene', 'Form', 'Protein'))
 
 
 class TestCaseBasicMuTree:
@@ -191,5 +199,22 @@ class TestCaseMuTypeBinary:
                      {('Form', 'Missense_Mutation'):
                       {('Exon', ('326/363', '302/363', '10/363')): None}}})
                     )
+
+
+class TestCaseCohort:
+    """Tests cohort functionality."""
+
+    def test_clf(self, cdata_small):
+        """Can we use a classifier on a Cohort?"""
+        mtype = MuType({('Gene', 'BRAF'):{('Protein', 'p.V600E'): None}})
+        clf = classif.Lasso()
+        old_C = clf.named_steps['fit'].C
+
+        cdata.tune_clf(clf, mtype=mtype)
+        assert clf.named_steps['fit'].C != old_C
+        cdata.score_clf(clf, mtype=mtype)
+        cdata.fit_clf(clf, mtype=mtype)
+        cdata.predict_clf(clf, use_test=False)
+        cdata.eval_clf(clf, mtype=mtype)
 
 

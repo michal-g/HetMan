@@ -15,28 +15,30 @@ import classif
 def main(argv):
 
     # define which mutations we want to consider in our test
-    mtypes = {
-        'TP53': MuType(
-            {('Gene', 'TP53'):{('Form', 'Missense_Mutation'):None}}),
-        'PIK3CA': MuType(
-            {('Gene', 'PIK3CA'):{('Protein', 'p.H1047R'):None}}),
-        'CDH1': MuType(
-            {('Gene', 'CDH1'):{('Form', 'Frame_Shift'):None}})
-        }
-    key_list = {'All': None, 'Down': ((['Down'], ()), )}
+    mtypes = [
+        MuType({('Gene', 'TP53'):{('Form', 'Missense_Mutation'):None}}),
+        MuType({('Gene', 'PIK3CA'):{('Protein', 'p.H1047R'):None}})
+        ]
+    mut_genes = [list(list(mtype.child.keys())[0])[0] for mtype in mtypes]
+    key_list = {'All': None,
+                'Up': ((['Up'], ()), ),
+                'Neigh': ((['Up', 'Down'], ()), ),
+                'expr': (((), ['controls-expression-of']), ),
+                'Down': ((['Down'], ()), )
+               }
 
     # load in expression and mutation datasets
     syn = synapseclient.Synapse()
     syn.login('grzadkow', 'W0w6g1i8A')
     cdata = Cohort(
-        syn, cohort=argv[0], mut_genes=['TP53', 'PIK3CA', 'CDH1'],
+        syn, cohort=argv[0], mut_genes=mut_genes,
         mut_levels=['Gene','Form','Protein'],
         cv_info={'Prop':2/3.0, 'Seed':int(argv[-1])+1})
 
     # define the classifiers to be used as well as the interval
     # cross-validation training samples for testing and tuning
     clf_list = [classif.NaiveBayes, classif.Lasso,
-                classif.SVCrbf, classif.rForest]
+                classif.SVCrbf, classif.rForest, classif.PCpipe]
 
     scores = {}
     times = {}
@@ -46,20 +48,27 @@ def main(argv):
         scores[clf_lbl] = {}
         times[clf_lbl] = {}
 
-        for mut_lbl, mtype in mtypes.items():
-            scores[clf_lbl][mut_lbl] = {}
-            times[clf_lbl][mut_lbl] = {}
+        for mut_gene, mtype in zip(mut_genes, mtypes):
+            scores[clf_lbl][mut_gene] = {}
+            times[clf_lbl][mut_gene] = {}
 
             for key_lbl, k in key_list.items():
+                clf_obj = clf(path_keys=k)
                 start_time = time.time()
-                scores[clf_lbl][mut_lbl][key_lbl] = round(cdata.score_clf(
-                    clf(mut_gene=mut_lbl, path_keys=k),
-                    score_splits=32, tune_splits=4, mtype=mtype), 4)
-                times[clf_lbl][mut_lbl][key_lbl] = round(
-                    time.time() - start_time, 1)
+                cdata.tune_clf(clf_obj, mtype=mtype,
+                               tune_splits=4, test_count=32)
+                print(clf_obj.named_steps['fit'])
 
-    print(pd.DataFrame(scores))
-    print(pd.DataFrame(times))
+                cdata.fit_clf(clf_obj, mtype=mtype)
+                scores[clf_lbl][mut_gene][key_lbl] = cdata.eval_clf(
+                    clf_obj, mtype=mtype)
+                times[clf_lbl][mut_gene][key_lbl] = time.time() - start_time
+
+    out_file = ('/home/users/grzadkow/compbio/scripts/HetMan/'
+                + 'experiments/output/base_'
+                + argv[-2] + '_' + argv[-1] + '_data.p')
+    out_data = {'AUC': scores, 'time': times}
+    pickle.dump(out_data, open(out_file, 'wb'))
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ classification ensembles of mutation sub-types.
 # Author: Michal Grzadkowski <grzadkow@ohsu.edu>
 
 from data import get_pc2_neighb
+from operator import mul
 from itertools import chain
 import re
 import dill as pickle
@@ -261,7 +262,15 @@ class UniPipe(Pipeline):
         """Tunes the classifier by sampling over the parameter space and
            choosing the parameters with the best 25th percentile.
         """
+
+        # checks if the classifier has parameters to be tuned
         if self._tune_priors:
+            prior_counts = [len(x) if hasattr(x, '__len__') else float('Inf')
+                            for x in self._tune_priors.values()]
+            max_tests = reduce(mul, prior_counts, 1)
+            test_count = min(test_count, max_tests)
+
+            # samples parameter combinations and tests each one
             grid_test = RandomizedSearchCV(
                 estimator=self, param_distributions=self._tune_priors,
                 fit_params={'feat__mut_genes': mut_genes,
@@ -271,6 +280,7 @@ class UniPipe(Pipeline):
                 )
             grid_test.fit(expr, mut)
 
+            # finds the best parameter combination and updates the classifier
             tune_scores = (grid_test.cv_results_['mean_test_score']
                            - grid_test.cv_results_['std_test_score'])
             self.set_params(

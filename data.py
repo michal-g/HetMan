@@ -121,7 +121,7 @@ def get_expr_firehose(cohort):
     gene_indx = [x not in ['gene_id','nan','?'] for x in gene_names]
     gene_indx[0] = False
     samp_names = raw_data.ix[0, :]
-    samp_indx = [not isinstance(x, float) and x.find('-01A-') != -1
+    samp_indx = [not isinstance(x, float) and x.find('TCGA-') != -1
                  for x in samp_names]
     
     # transforms raw data into expression matrix
@@ -267,11 +267,16 @@ def get_cnv_firehose(cohort):
        Use ./firehose_get -tasks CopyNumber_Gistic2 analyses latest
        to download these files for all available cohorts.
     """
+
+    # gets CNV file name, loads data
+    if cohort != 'SKCM':
+        coh_lbl = cohort + '-TP'
+    else:
+        coh_lbl = cohort + '-TM'
     cnv_file = (
         _base_dir + 'input-data/analyses__2016_01_28/' + cohort
-        + '/20160128/gdac.broadinstitute.org_' + cohort
-        + '-TP.CopyNumber_Gistic2.Level_4.2016012800.0.0/'
-        + 'all_data_by_genes.txt'
+        + '/20160128/gdac.broadinstitute.org_' + coh_lbl
+        + '.CopyNumber_Gistic2.Level_4.2016012800.0.0/all_data_by_genes.txt'
         )
     raw_data = pd.read_csv(cnv_file, sep='\t')
 
