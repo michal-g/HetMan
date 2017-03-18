@@ -1,15 +1,15 @@
 
 """
 Hetman (Heterogeneity Manifold)
-Classification of mutation sub-types using expression data.
-This file contains the algorithms used as building blocks for the
-classification ensembles of mutation sub-types.
+Prediction of mutation sub-types using expression data.
+This file contains the algorithms used to predict discrete mutation states.
 """
 
 # Author: Michal Grzadkowski <grzadkow@ohsu.edu>
 
-from data import get_pc2_neighb
-from operator import mul
+from pipelines import ClassPipe
+from selection import PathwaySelect
+
 from itertools import chain
 import re
 import dill as pickle
@@ -20,22 +20,13 @@ import numpy as np
 from scipy import stats
 import dirichlet
 
-from sklearn.feature_selection.base import SelectorMixin
 from sklearn.svm.base import BaseSVC
-from sklearn.feature_selection import GenericUnivariateSelect
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import (
-    StandardScaler, PolynomialFeatures, RobustScaler)
-from sklearn.model_selection import (
-    RandomizedSearchCV, StratifiedShuffleSplit)
-from sklearn.metrics import roc_auc_score
 from sklearn.metrics.pairwise import (
     rbf_kernel, check_pairwise_arrays, pairwise_distances)
-from sklearn.random_projection import GaussianRandomProjection
-from sklearn.decomposition import PCA
 
+from sklearn.preprocessing import StandardScaler
 from sklearn.naive_bayes import GaussianNB
-from sklearn.linear_model import LogisticRegression, SGDClassifier
+from sklearn.linear_model import LogisticRegression
 from sklearn.svm import SVC
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.neighbors import KNeighborsClassifier
@@ -43,387 +34,122 @@ from sklearn.gaussian_process import GaussianProcessClassifier
 from sklearn.cluster import KMeans
 
 
-# .. helper functions for classification and feature selection classes ..
-def _mut_ttest(expr_vec, mut):
-    """Performs the Student's t-test on the hypothesis that the given
-       expression values differ according to the given mutation status.
-
-    Parameters
-    ----------
-    expr_vec : array-like, shape (n_samples,)
-        Expression values for a set of samples.
-
-    mut : array-like, shape (n_samples,)
-        Boolean mutation status for the same set of samples.
-
-    Returns
-    -------
-    score : float
-        A negative log-transform of the t-test p-value, so that higher
-        values -> higher significance.
-    """
-    score = log(stats.ttest_ind(
-        expr_vec[mut],
-        expr_vec[np.invert(mut)])[1] + 10 ** -323,
-        10) * -1
-    if np.isnan(score):
-        score = 0
-    return score
-
-
-def _gene_mean(X, y):
-    gene_scores = np.apply_along_axis(
-        func1d=lambda x: np.mean(x),
-        axis=0, arr=X
-        )
-    return gene_scores, [0 for g in gene_scores]
-
-
-def _gene_sd(X, y):
-    gene_scores = np.apply_along_axis(
-        func1d=lambda x: np.var(x) ** 0.5,
-        axis=0, arr=X
-        )
-    return gene_scores, [0 for g in gene_scores]
-
-
-def _gene_cv(X, y):
-    gene_scores = np.apply_along_axis(
-        func1d=lambda x: np.mean(x) / (np.var(x) ** 0.5),
-        axis=0, arr=X
-        )
-    return gene_scores, [0 for g in gene_scores]
-
-
-def _gene_meancv(X, y):
-    gene_scores = np.apply_along_axis(
-        func1d=lambda x: np.mean(x) * (np.var(x) ** 0.5),
-        axis=0, arr=X
-        )
-    return gene_scores, [0 for g in gene_scores]
-
-
-class GeneSelect(GenericUnivariateSelect):
-    """A class for pathway Commons-based feature selection for use in
-       in classification of mutation sub-types.
-    """
-
-    def __init__(self,
-                 path_prior, path_dir,
-                 mut_genes, expr_genes):
-        self.mut_genes = mut_genes
-        self.expr_genes = expr_genes
-        self.link_data = read_sif(mut_genes)
-        link_genes = set()
-        for gene,directs in list(self.link_data.items()):
-            for direction,int_types in list(directs.items()):
-                for int_type,genes in list(int_types.items()):
-                    link_genes |= set(genes)
-        self.link_genes = tuple(link_genes & set(self.expr_genes))
-        self.link_indx = {g:self.expr_genes.index(g)
-                          for g in self.link_genes}
-        self._tune_params = {'path_prior':path_prior, 'path_dir':path_dir}
-        GenericUnivariateSelect.__init__(self,
-            score_func=self._score_genes, mode='k_best', param=30
-            )
-
-    def _score_genes(self, X, y):
-        """Scores genes according to a univariate test for association with
-        mutation status in conjunction with their interactions with the
-        mutated genes.
-        """
-        gene_scores = np.apply_along_axis(
-            func1d=lambda x: _mut_ttest(x, y),
-            axis=0, arr=X[:,list(self.link_indx.values())]
-            )
-        for gene,directs in list(self.link_data.items()):
-            for direction,int_types in list(directs.items()):
-                for int_type,genes in list(int_types.items()):
-                    for g in list(set(genes) & set(self.link_genes)):
-                        g_indx = self.link_genes.index(g)
-                        gene_scores[g_indx] *= self.params['path_prior']
-                        if direction == 'in':
-                            gene_scores[g_indx] *= self.params['path_dir']
-                        elif direction == 'out':
-                            gene_scores[g_indx] *= (self.params['path_dir'] **
-                                                    -1)
-
-        return [gene_scores[self.link_genes.index(g)]
-                if g in self.link_genes
-                else 0
-                for g in self.expr_genes], [0 for g in self.expr_genes]
-
-
-class PathwaySelect(SelectorMixin):
-    """Chooses gene features based on their presence
-       in Pathway Commons pathways.
-    """
-
-    def __init__(self, path_keys=None):
-        self.path_keys = path_keys
-        super(PathwaySelect, self).__init__()
-
-    def fit(self, X, y, **fit_params):
-        mut_genes = fit_params['mut_genes']
-        if self.path_keys is None:
-            self.select_genes = set(X.columns)
-        else:
-            path_obj = fit_params['path_obj']
-            select_genes = set()
-            for gene in mut_genes:
-                for pdirs, ptypes in self.path_keys:
-                    if len(pdirs) == 0:
-                        select_genes |= set(chain(*chain(
-                            *[[g for t,g in v.items() if t in ptypes]
-                            for v in path_obj[gene].values()]
-                            )))
-                    elif len(ptypes) == 0:
-                        select_genes |= set(chain(*chain(
-                            *[v.values() for k,v in path_obj[gene].items()
-                            if k in pdirs]
-                            )))
-                    else:
-                        select_genes |= set(chain(*chain(
-                            *[[g for t,g in v.items() if t in ptypes]
-                            for k,v in path_obj[gene].items() if k in pdirs]
-                            )))
-            self.select_genes = select_genes
-
-        self.select_genes -= set(mut_genes)
-        self.expr_genes = X.columns
-        return self
-
-    def _get_support_mask(self):
-        return np.array([g in self.select_genes for g in self.expr_genes])
-    
-    def set_params(self, **kwargs):
-        for k,v in kwargs.items():
-            setattr(self, k, v)
-
-    def get_params(self, deep=True):
-        return {'path_keys': self.path_keys}
-
-
-class UniPipe(Pipeline):
-    """A class corresponding to expression-based classifiers of mutation
-       status that use a single expr-mut dataset.
-    """
-
-    def __init__(self, steps):
-        super(UniPipe, self).__init__(steps)
-
-    def __str__(self):
-        """Prints the tuned parameters of the classifier."""
-        param_list = self.get_params()
-        param_str = reduce(
-            lambda x,y: x + ', ' + y,
-            [k + ': ' + '%s' % float('%.4g' % param_list[k]))
-             for k in list(self._tune_priors.keys())]
-            )
-        return type(self).__name__ + ' with ' + param_str
-
-    def prob_mut(self, expr):
-        """Returns the probability of mutation presence calculated by the
-           classifier based on the given expression matrix.
-        """
-        mut_scores = self.predict_proba(expr)
-        if hasattr(self, 'classes_'):
-            true_indx = [i for i,x in enumerate(self.classes_) if x]
-        else:
-            wghts = tuple(self.named_steps['fit'].weights_)
-            true_indx = wghts.index(min(wghts))
-        return [m[true_indx] for m in mut_scores]
-
-    @classmethod
-    def score_auc(cls, estimator, expr, mut):
-        """Computes the AUC score using the classifier on a expr-mut pair.
-           Used for compatibility with tuning, scoring methods.
-
-        Parameters
-        ----------
-        expr : array-like, shape (n_samples,n_features)
-            An expression dataset.
-
-        mut : array-like, shape (n_samples,)
-            A boolean vector corresponding to the presence of a particular
-            type of mutation in the same set of samples as the given
-            expression dataset.
-
-        Returns
-        -------
-        S : float
-            The AUC score corresponding to mutation classification accuracy.
-        """
-        mut_scores = estimator.prob_mut(expr)
-        return roc_auc_score(mut, mut_scores)
-
-    def tune(self, expr, mut, mut_genes, path_obj, cv_samples,
-             test_count=16, update_priors=False, verbose=False):
-        """Tunes the classifier by sampling over the parameter space and
-           choosing the parameters with the best 25th percentile.
-        """
-
-        # checks if the classifier has parameters to be tuned
-        if self._tune_priors:
-            prior_counts = [len(x) if hasattr(x, '__len__') else float('Inf')
-                            for x in self._tune_priors.values()]
-            max_tests = reduce(mul, prior_counts, 1)
-            test_count = min(test_count, max_tests)
-
-            # samples parameter combinations and tests each one
-            grid_test = RandomizedSearchCV(
-                estimator=self, param_distributions=self._tune_priors,
-                fit_params={'feat__mut_genes': mut_genes,
-                            'feat__path_obj': path_obj},
-                n_iter=test_count, scoring=self.score_auc,
-                cv=cv_samples, n_jobs=-1, refit=False
-                )
-            grid_test.fit(expr, mut)
-
-            # finds the best parameter combination and updates the classifier
-            tune_scores = (grid_test.cv_results_['mean_test_score']
-                           - grid_test.cv_results_['std_test_score'])
-            self.set_params(
-                **grid_test.cv_results_['params'][tune_scores.argmax()])
-            if update_priors:
-                self.update_priors(grid_test.cv_results_)
-            if verbose:
-                print(self)
-
-        return self
-
-    def update_priors(self, cv_results):
-        """Experimental method for updating priors of tuning parameter space
-           based on the outcome of cross-validation testing.
-        """
-        for param in self._tune_priors.keys():
-            new_perf = [param * (exp(perf))
-                        for param,perf in
-                zip([param for param,perf in param_list],
-                    perf_list)]
-            new_mean = reduce(lambda x,y: x*y, new_perf)
-            new_mean = new_mean ** (1.0/len(param_list))
-            new_sd = np.mean([(log(x) - log(new_mean)) ** 2
-                              for x in new_perf]) ** 0.5
-
-            new_mean,new_sd = _update_params(
-                [(x[param],y)
-                 for x,y in zip(
-                     grid_test.cv_results_['params'],
-                     grid_test.cv_results_['mean_test_score'])
-                    ])
-            self._param_priors[param] = stats.lognorm(
-                scale=new_mean, s=new_sd)
-        return self
-
-    def get_coef(self):
-        """Gets the coefficients of the classifier."""
-        return self.named_steps['fit'].coefs_
-
-
 # .. classifiers that don't use any prior information ..
-class NaiveBayes(UniPipe):
+class NaiveBayes(ClassPipe):
     """A class corresponding to Gaussian Naive Bayesian classification
        of mutation status.
     """
 
     def __init__(self, path_keys=None):
-        self._tune_priors = {}
         feat_step = PathwaySelect(path_keys=path_keys)
         norm_step = StandardScaler()
         fit_step = GaussianNB()
-        UniPipe.__init__(self,
-            [('feat', feat_step), ('norm', norm_step), ('fit', fit_step)])
-        self.set_params(path_keys=path_keys)
+        ClassPipe.__init__(self,
+            [('feat', feat_step), ('norm', norm_step), ('fit', fit_step)],
+            path_keys)
 
 
-class Lasso(UniPipe):
+class Lasso(ClassPipe):
     """A class corresponding to logistic regression classification
        of mutation status with the lasso regularization penalty.
     """
 
+    tune_priors = (
+        ('fit__C', stats.lognorm(scale=exp(-1), s=exp(1))),
+    )
+
     def __init__(self, path_keys=None):
-        self._tune_priors = {
-            'fit__C':stats.lognorm(scale=exp(-1), s=exp(1))}
         feat_step = PathwaySelect(path_keys=path_keys)
         norm_step = StandardScaler()
         fit_step = LogisticRegression(
             penalty='l1', tol=1e-2, class_weight='balanced')
-        UniPipe.__init__(self,
-            [('feat', feat_step), ('norm', norm_step), ('fit', fit_step)])
-        self.set_params(path_keys=path_keys)
+        ClassPipe.__init__(self,
+            [('feat', feat_step), ('norm', norm_step), ('fit', fit_step)],
+            path_keys)
 
 
-class LogReg(UniPipe):
+class LogReg(ClassPipe):
     """A class corresponding to logistic regression classification
        of mutation status with the elastic net regularization penalty.
     """
 
-    def __init__(self, mut_genes=None, expr_genes=None):
-        self._tune_priors = {
-            'fit__alpha':stats.lognorm(scale=exp(1), s=exp(1)),
-            'fit__l1_ratio':[0,0.25,0.5,0.75,1.0]}
+    tune_priors = (
+        ('fit__alpha', stats.lognorm(scale=exp(1), s=exp(1))),
+        ('fit__l1_ratio', (0.05,0.25,0.5,0.75,1.0))
+    )
+
+    def __init__(self, path_keys=None):
+        feat_step = PathwaySelect(path_keys=path_keys)
         norm_step = StandardScaler()
         fit_step = SGDClassifier(
             loss='log', penalty='elasticnet',
             n_iter=100, class_weight='balanced')
-        UniPipe.__init__(self,
-            [('norm', norm_step), ('fit', fit_step)])
+        ClassPipe.__init__(self,
+            [('feat', feat_step), ('norm', norm_step), ('fit', fit_step)],
+            path_keys)
 
 
-class Ridge(UniPipe):
+class Ridge(ClassPipe):
     """A class corresponding to logistic regression classification
-       of mutation status with the lasso regularization penalty.
+       of mutation status with the ridge regularization penalty.
     """
 
-    def __init__(self, mut_genes=None, expr_genes=None):
-        self._tune_priors = {
-            'fit__C':stats.lognorm(scale=exp(-1), s=exp(1))}
-        norm_step = RobustScaler()
+    tune_priors = (
+        ('fit__C', stats.lognorm(scale=exp(-1), s=exp(1))),
+    )
+
+    def __init__(self, path_keys=None):
+        feat_step = PathwaySelect(path_keys=path_keys)
+        norm_step = StandardScaler()
         fit_step = LogisticRegression(
-            penalty='l2', tol=1e-2, class_weight='balanced')
-        UniPipe.__init__(self,
-            [('norm', norm_step), ('fit', fit_step)])
+            penalty='l1', tol=1e-2, class_weight='balanced')
+        ClassPipe.__init__(self,
+            [('feat', feat_step), ('norm', norm_step), ('fit', fit_step)],
+            path_keys)
 
 
-class SVCrbf(UniPipe):
+class SVCrbf(ClassPipe):
     """A class corresponding to C-support vector classification
        of mutation status with a radial basis kernel.
     """
    
+    tune_priors = (
+        ('fit__C', stats.lognorm(scale=exp(-1), s=exp(1))),
+        ('fit__gamma', stats.lognorm(scale=1e-5, s=exp(2)))
+    )
+
     def __init__(self, path_keys=None):
-        self._tune_priors = {
-            'fit__C':stats.lognorm(scale=exp(-1), s=exp(1)),
-            'fit__gamma':stats.lognorm(scale=1e-5, s=exp(2))}
         feat_step = PathwaySelect(path_keys=path_keys)
         norm_step = StandardScaler()
         fit_step = SVC(
-            kernel='rbf', probability=True, class_weight='balanced',
-            cache_size=500)
-        UniPipe.__init__(self,
-            [('feat', feat_step), ('norm', norm_step), ('fit', fit_step)])
-        self.set_params(path_keys=path_keys)
+            kernel='rbf', probability=True,
+            cache_size=500, class_weight='balanced')
+        ClassPipe.__init__(self,
+            [('feat', feat_step), ('norm', norm_step), ('fit', fit_step)],
+            path_keys)
 
 
-class rForest(UniPipe):
+class rForest(ClassPipe):
     """A class corresponding to random forest classification
        of mutation status.
     """
 
+    tune_priors = (
+        ('fit__max_features', (0.005,0.01,0.02,0.04,0.08,0.15)),
+        ('fit__min_samples_leaf', (0.0001,0.01,0.05))
+    )
+
     def __init__(self, path_keys=None):
-        self._tune_priors = {
-            'fit__max_features':[0.005,0.01,0.02,0.04,0.08,0.15],
-            'fit__min_samples_leaf':[0.0001,0.01,0.05]}
         feat_step = PathwaySelect(path_keys=path_keys)
         norm_step = StandardScaler()
         fit_step = RandomForestClassifier(
                     n_estimators=500, class_weight='balanced')
-        UniPipe.__init__(self,
-            [('feat', feat_step), ('norm', norm_step), ('fit', fit_step)])
-        self.set_params(path_keys=path_keys)
+        ClassPipe.__init__(self,
+            [('feat', feat_step), ('norm', norm_step), ('fit', fit_step)],
+            path_keys)
 
 
-class KNeigh(UniPipe):
+class KNeigh(ClassPipe):
     """A class corresponding to k-nearest neighbours voting classification
        of mutation status.
     """
@@ -435,11 +161,11 @@ class KNeigh(UniPipe):
         norm_step = StandardScaler()
         fit_step = KNeighborsClassifier(
             weights='distance', algorithm='ball_tree')
-        UniPipe.__init__(self,
+        ClassPipe.__init__(self,
             [('norm', norm_step), ('fit', fit_step)])
 
 
-class GBCrbf(UniPipe):
+class GBCrbf(ClassPipe):
     """A class corresponding to gaussian process classification
        of mutation status with a radial basis kernel.
     """
@@ -448,11 +174,11 @@ class GBCrbf(UniPipe):
         self._tune_priors = {}
         norm_step = StandardScaler()
         fit_step = GaussianProcessClassifier()
-        UniPipe.__init__(self,
+        ClassPipe.__init__(self,
             [('norm', norm_step), ('fit', fit_step)])
 
 
-class NewTest(UniPipe):
+class NewTest(ClassPipe):
     """A class for testing miscellaneous new classification pipelines."""
 
     def __init__(self, mut_genes=None, expr_genes=None):
@@ -463,7 +189,7 @@ class NewTest(UniPipe):
         feat_step = PolynomialFeatures(2)
         fit_step = LogisticRegression(
             penalty='l2', tol=1e-2, class_weight='balanced')
-        UniPipe.__init__(self,
+        ClassPipe.__init__(self,
             [('proj', proj_step), ('feat', feat_step), ('fit', fit_step)])
 
 
@@ -509,7 +235,7 @@ class SVCpath(SVC):
         self.set_params(mut_gene=mut_gene)
 
 
-class SVCpcRS(UniPipe):
+class SVCpcRS(ClassPipe):
     """A class corresponding to Pathway Commons - based classification
        of mutation status using robust standardization.
     """
@@ -522,7 +248,7 @@ class SVCpcRS(UniPipe):
         fit_step = SVCpath(
             mut_gene=mut_genes[0], expr_genes=expr_genes,
             dir_mix={'Down':1.0}, type_mix={'controls-state-change-of':1.0})
-        UniPipe.__init__(self,
+        ClassPipe.__init__(self,
                                [('norm', norm_step), ('fit', fit_step)])
         self.set_params(mut_genes=mut_genes, expr_genes=expr_genes)
 
@@ -703,7 +429,7 @@ class PCdir(BaseSVC):
         return self.clf_prob.predict_proba(new_kern)
 
 
-class PathwayCluster(Pipeline):
+class PathwayCluster(ClassPipe):
 
     def __init__(self, path_key, expr_genes):
         feat_step = PathwaySelect(path_key, expr_genes)
@@ -713,7 +439,7 @@ class PathwayCluster(Pipeline):
             [('feat', feat_step), ('norm', norm_step), ('fit', fit_step)])
 
 
-class PCsvm(UniPipe):
+class PCsvm(ClassPipe):
     """A class corresponding to SVM classification of mutation status using
        a convex combination of kernels based on Pathway Commons.
     """
@@ -730,7 +456,7 @@ class PCsvm(UniPipe):
         feat_step = PathwaySelect(self.path_obj)
         norm_step = StandardScaler()
         fit_step = PCsvc(self.path_obj)
-        UniPipe.__init__(self,
+        ClassPipe.__init__(self,
             [('feat', feat_step), ('norm', norm_step), ('fit', fit_step)])
 
     def fit(self, X, y, **fit_params):
@@ -759,7 +485,7 @@ class PCsvm(UniPipe):
         return self
 
 
-class PCpipe(UniPipe):
+class PCpipe(ClassPipe):
     """A class corresponding to
     """
 
@@ -768,12 +494,12 @@ class PCpipe(UniPipe):
         feat_step = PathwaySelect(path_keys=path_keys)
         norm_step = StandardScaler()
         fit_step = PCdir()
-        UniPipe.__init__(self,
+        ClassPipe.__init__(self,
             [('feat', feat_step), ('norm', norm_step), ('fit', fit_step)])
         self.set_params(path_keys=path_keys)
 
 
-class PCgbc(UniPipe):
+class PCgbc(ClassPipe):
     """A class corresponding to
     """
 
@@ -800,12 +526,12 @@ class PCgbc(UniPipe):
         norm_step = StandardScaler()
         fit_step = gaussian_process.GaussianProcessClassifier(
             kernel=self._pc_kernel)
-        UniPipe.__init__(self,
+        ClassPipe.__init__(self,
             [('norm', norm_step), ('fit', fit_step)])
         self.set_params(**self._tune_params)
 
 
-class PolyLasso(UniPipe):
+class PolyLasso(ClassPipe):
     """A class corresponding to logistic regression classification"""
     """of mutation status with the lasso regularization penalty."""
 
@@ -819,12 +545,12 @@ class PolyLasso(UniPipe):
         norm_step = StandardScaler()
         poly_step = PolynomialFeatures(2)
         fit_step = LogisticRegression(penalty='l1', tol=5e-3)
-        UniPipe.__init__(self,
+        ClassPipe.__init__(self,
             [('feat', feat_step), ('poly', poly_step),
              ('norm', norm_step), ('fit', fit_step)])
 
 
-class Mixture(UniPipe):
+class Mixture(ClassPipe):
     """A class corresponding to gaussian mixture model
        classification of mutation status.
     """
@@ -847,14 +573,14 @@ class Mixture(UniPipe):
             tol=5e-3, max_iter=50, 
             n_init=3, init_params='kmeans', weights_init=[0.8,0.2]
             )
-        UniPipe.__init__(self,
+        ClassPipe.__init__(self,
             [('norm', norm_step),
              ('feat', feat_step),
              ('fit', fit_step)])
         self.set_params(**self._tune_params)
 
 
-class PolyrbfSVM(UniPipe):
+class PolyrbfSVM(ClassPipe):
     """A class corresponding to gaussian kernal support vector"""
     """classification of mutation status."""
 
@@ -877,7 +603,7 @@ class PolyrbfSVM(UniPipe):
             gamma=self._tune_params['fit__gamma'],
             class_weight={False:1, True:1}, probability=True
             )
-        UniPipe.__init__(self,
+        ClassPipe.__init__(self,
             [('norm', norm_step),
              ('feat', feat_step),
              ('poly', poly_step),
@@ -885,7 +611,7 @@ class PolyrbfSVM(UniPipe):
         self.set_params(**self._tune_params)
 
 
-class rbfSVMpc(UniPipe):
+class rbfSVMpc(ClassPipe):
     """A class corresponding toz gaussian kernal support vector"""
     """classification of mutation status."""
 
@@ -919,7 +645,7 @@ class rbfSVMpc(UniPipe):
             class_weight={False:1, True:1},
             probability=True
             )
-        UniPipe.__init__(self,
+        ClassPipe.__init__(self,
             [('norm', norm_step),
              ('feat', feat_step),
              ('fit', fit_step)])

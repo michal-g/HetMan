@@ -1,4 +1,4 @@
-name: HetMan
+name: 'HetMan'
 PYTHON_PATH: "/home/users/grzadkow/compbio/scripts/HetMan"
 channels:
 - defaults
