@@ -31,7 +31,7 @@ class ElasticNet(RegrPipe):
     def __init__(self, path_keys=None):
         feat_step = PathwaySelect(path_keys=path_keys)
         norm_step = StandardScaler()
-        fit_step = ENet(normalize=False)
+        fit_step = ENet(normalize=False, max_iter=5000)
         RegrPipe.__init__(self,
             [('feat', feat_step), ('norm', norm_step), ('fit', fit_step)],
             path_keys)

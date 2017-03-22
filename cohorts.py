@@ -18,13 +18,14 @@ from functools import reduce
 from scipy.stats import fisher_exact
 import random
 
-from sklearn import model_selection
+from sklearn.model_selection import (
+    StratifiedShuffleSplit, cross_val_score)
+from sklearn.model_selection._split import (
+    _validate_shuffle_split, _approximate_mode)
 from sklearn.metrics import roc_auc_score
 from sklearn.utils import indexable, check_random_state, safe_indexing
 from sklearn.utils.validation import check_array, _num_samples
 from sklearn.utils.fixes import bincount
-from sklearn.model_selection._split import (
-    BaseShuffleSplit, _validate_shuffle_split, _approximate_mode)
 
 
 # .. helper functions ..
@@ -40,7 +41,8 @@ def _safe_load_path(genes):
 
     return pathways
 
-class HetManMutError(Exception):
+
+class HetManCohortError(Exception):
     pass
 
 
@@ -112,7 +114,7 @@ class Cohort(object):
         return samps, genes
 
     def __init__(self,
-                 syn, cohort, mut_genes, mut_levels=('Gene', 'For`m'),
+                 syn, cohort, mut_genes, mut_levels=('Gene', 'Form'),
                  load_path=True, cv_info=None):
         self.cohort_ = cohort
         if cv_info is None:
@@ -124,7 +126,7 @@ class Cohort(object):
         # neighbourhood for mutated genes
         annot = get_annot()
         expr = get_expr_firehose(cohort)
-        muts = get_mut_mc3(syn, list(set(mut_levels) - set(['GISTIC'])))
+        muts = get_mut_mc3(syn)
         cnvs = get_cnv_firehose(cohort)
         if load_path:
             self.path_ = _safe_load_path(mut_genes)
@@ -148,7 +150,7 @@ class Cohort(object):
             set(muts['Sample']) & set(expr.index) & set(cnvs.index))
         expr = expr.loc[self.samples, :]
         cnvs = cnvs.loc[self.samples, mut_genes]
-        self.cnvs_ = cnvs.copy()
+        muts = muts.loc[muts['Gene'].isin(mut_genes), :]
 
         # merges simple somatic mutations with CNV calls
         cnvs['Sample'] = cnvs.index
@@ -180,15 +182,12 @@ class Cohort(object):
         # creates training and testing expression and mutation datasets
         self.train_expr_ = log_norm_expr(expr.loc[self.train_samps_, :])
         self.test_expr_ = log_norm_expr(expr.loc[self.test_samps_, :])
-        self.train_mut_ = MuTree(muts=muts, samples=self.train_samps_,
-                                 genes=mut_genes, levels=mut_levels)
-        self.test_mut_ = MuTree(muts=muts, samples=self.test_samps_,
-                                genes=mut_genes, levels=mut_levels)
-
-    def get_cnv_scores(self, samples, gene=None):
-        if gene is None:
-            gene = self.mut_genes[0]
-        return self.cnvs_.loc[samples, gene]
+        self.train_mut_ = MuTree(
+            muts=muts.loc[muts['Sample'].isin(self.train_samps_), :],
+            levels=mut_levels)
+        self.test_mut_ = MuTree(
+            muts=muts.loc[muts['Sample'].isin(self.test_samps_), :],
+            levels=mut_levels)
 
     def mutex_test(self, mtype1, mtype2):
         """Checks the mutual exclusivity of two mutation types in the
@@ -222,7 +221,7 @@ class Cohort(object):
         """Fits a classifier."""
         samps, genes = self._validate_dims(exclude_samps=exclude_samps,
                                            gene_list=gene_list)
-        fit_muts = self.train_mut_.status(samps, mtype)
+        fit_muts = self.train_mut_.mut_vec(clf, samps, mtype)
         return clf.fit(X=self.train_expr_.loc[samps, genes], y=fit_muts,
                        feat__mut_genes=list(
                            reduce(lambda x,y: x|y, mtype.child.keys())),
@@ -235,11 +234,11 @@ class Cohort(object):
                                            gene_list=gene_list,
                                            use_test=use_test)
         if use_test:
-            probs = clf.prob_mut(expr=self.test_expr_.loc[samps, genes])
+            muts = clf.predict_mut(expr=self.test_expr_.loc[samps, genes])
         else:
-            probs = clf.prob_mut(expr=self.train_expr_.loc[samps, genes])
+            muts = clf.predict_mut(expr=self.train_expr_.loc[samps, genes])
 
-        return probs
+        return muts
 
     def tune_clf(self,
                  clf, mtype=None, tune_splits=2, test_count=16,
@@ -264,13 +263,17 @@ class Cohort(object):
             Whether or not the classifier should print information about the
             optimal hyper-parameters found during tuning.
         """
+
+        # gets samples, genes, and mutation vector to use for tuning
         samps, genes = self._validate_dims(exclude_samps=exclude_samps,
                                            gene_list=gene_list)
-        tune_muts = self.train_mut_.status(samps, mtype)
-        tune_cvs = model_selection.StratifiedShuffleSplit(
+        tune_muts = self.train_mut_.mut_vec(clf, samps, mtype)
+
+        # get internal cross-validation splits in the training set and use
+        # them to tune the classifier
+        tune_cvs = MutShuffleSplit(
             n_splits=tune_splits, test_size=0.2,
             random_state=(self.intern_cv_ ** 2) % 42949672)
-
         return clf.tune(expr=self.train_expr_.loc[samps, genes],
                         mut=tune_muts, path_obj=self.path_,
                         mut_genes=list(
@@ -309,12 +312,12 @@ class Cohort(object):
         """
         samps, genes = self._validate_dims(exclude_samps=exclude_samps,
                                            gene_list=gene_list)
-        score_muts = self.train_mut_.status(samps, mtype)
-        score_cvs = model_selection.StratifiedShuffleSplit(
+        score_muts = self.train_mut_.mut_vec(clf, samps, mtype)
+        score_cvs = MutShuffleSplit(
             n_splits=score_splits, test_size=0.2,
             random_state=self.intern_cv_)
 
-        cv_score = np.percentile(model_selection.cross_val_score(
+        cv_score = np.percentile(cross_val_score(
             estimator=clf, X=self.train_expr_.loc[samps, genes], y=score_muts,
             fit_params={'feat__mut_genes': list(
                 reduce(lambda x,y: x|y, mtype.child.keys())),
@@ -328,11 +331,9 @@ class Cohort(object):
         """Evaluate the performance of a classifier."""
         samps, genes = self._validate_dims(exclude_samps=exclude_samps,
                                            gene_list=gene_list, use_test=True)
-        probs = self.predict_clf(clf, use_test=True, gene_list=gene_list,
-                                 exclude_samps=exclude_samps)
-        eval_muts = self.test_mut_.status(samps, mtype)
-
-        return roc_auc_score(eval_muts, probs)
+        eval_muts = self.test_mut_.mut_vec(clf, samps, mtype)
+        return clf.score_mut(clf,
+                             self.test_expr_.loc[samps, genes], eval_muts)
 
 
 class MultiCohort(object):
@@ -448,7 +449,7 @@ class MultiCohort(object):
                                            exclude_samps=exclude_samps)
         tune_muts = [coh.train_mut_.status(smps, mtype)
                      for (_,coh), smps in zip(self, samps)]
-        tune_cvs = MultiStratifiedShuffleSplit(
+        tune_cvs = MutShuffleSplit(
             n_splits=tune_splits, test_size=0.2,
             random_state=(self.intern_cv_ ** 2) % 42949672)
 
@@ -517,11 +518,11 @@ class MultiCohort(object):
 
         score_muts = [coh.train_mut_.status(smps, mtype)
                       for (_,coh), smps in zip(self, samps)]
-        score_cvs = MultiStratifiedShuffleSplit(
+        score_cvs = MutShuffleSplit(
             n_splits=score_splits, test_size=0.2,
             random_state=self.intern_cv_ % 42949672)
 
-        return np.percentile(model_selection.cross_val_score(
+        return np.percentile(cross_val_score(
             estimator=multiclf,
             X=[coh.train_expr_.loc[smps, gns]
                for (_,coh), smps, gns in zip(self, samps, genes)],
@@ -614,81 +615,102 @@ class MultiCohort(object):
         return pred_scores
 
 
-class MultiStratifiedShuffleSplit(BaseShuffleSplit):
-    """Generates splits of multiple cohorts into training and testing sets
-       that are stratified according to the classes in the response vectors.
+class MutShuffleSplit(StratifiedShuffleSplit):
+    """Generates splits of single or multiple cohorts into training and
+       testing sets that are stratified according to the mutation vectors.
     """
 
-    def __init__(self, n_splits=10, test_size=0.1, train_size=None,
+    def __init__(self,
+                 n_splits=10, test_size=0.1, train_size=None,
                  random_state=None):
-        super(MultiStratifiedShuffleSplit, self).__init__(
+        super(MutShuffleSplit, self).__init__(
             n_splits, test_size, train_size, random_state)
 
-    def _iter_indices(self, X_list, y_list=None, groups=None):
-        # gets info about input
-        n_samples = [_num_samples(X) for X in X_list]
-        y_list = [check_array(y, ensure_2d=False, dtype=None)
-                  for y in y_list]
-        n_train_test = [
-            _validate_shuffle_split(n_samps, self.test_size, self.train_size)
-            for n_samps in n_samples]
-        class_info = [np.unique(y, return_inverse=True) for y in y_list]
-        n_classes = [classes.shape[0] for classes,_ in class_info]
-        classes_counts = [bincount(y_indices)
-                          for _,y_indices in class_info]
+    def _iter_indices(self, expr, mut=None, groups=None):
+        """Generates indices of training/testing splits for use in
+           stratified shuffle splitting of cohort data.
+        """
 
-        # makes sure we have enough samples in each class for stratification
-        for i, (n_train, n_test) in enumerate(n_train_test):
-            if np.min(classes_counts[i]) < 2:
-                raise ValueError("The least populated class in y has only 1 "
-                                "member, which is too few. The minimum "
-                                "number of groups for any class cannot "
-                                "be less than 2.")
+        # with one cohort, proceed with stratified sampling, binning mutation
+        # values if they are continuous
+        if hasattr(expr, 'shape'):
+            if len(np.unique(mut)) > 2:
+                mut = mut > np.percentile(mut, 50)
+            for train, test in super(MutShuffleSplit, self)._iter_indices(
+                X=expr, y=mut, groups=groups):
+                yield train, test
 
-            if n_train < n_classes[i]:
-                raise ValueError('The train_size = %d should be greater or '
-                                'equal to the number of classes = %d'
-                                % (n_train, n_classes[i]))
+        # otherwise, perform stratified sampling on each cohort separately
+        else:
 
-            if n_test < n_classes[i]:
-                raise ValueError('The test_size = %d should be greater or '
-                                'equal to the number of classes = %d'
-                                % (n_test, n_classes[i]))
+            # gets info about input
+            n_samples = [_num_samples(X) for X in expr]
+            mut = [check_array(y, ensure_2d=False, dtype=None)
+                      for y in mut]
+            n_train_test = [
+                _validate_shuffle_split(n_samps, self.test_size, self.train_size)
+                for n_samps in n_samples]
+            class_info = [np.unique(y, return_inverse=True) for y in mut]
+            n_classes = [classes.shape[0] for classes,_ in class_info]
+            classes_counts = [bincount(y_indices)
+                              for _,y_indices in class_info]
 
-        # generates random training and testing cohorts
-        rng = check_random_state(self.random_state)
-        for _ in range(self.n_splits):
-            n_is = [_approximate_mode(class_counts, n_train, rng)
-                    for class_counts, (n_train, _)
-                    in zip(classes_counts, n_train_test)]
-            classes_counts_remaining = [class_counts - n_i
-                                        for class_counts, n_i
-                                        in zip(classes_counts, n_is)]
-            t_is = [_approximate_mode(class_counts_remaining, n_test, rng)
-                    for class_counts_remaining, (_, n_test)
-                    in zip(classes_counts_remaining, n_train_test)]
+            # makes sure we have enough samples in each class for stratification
+            for i, (n_train, n_test) in enumerate(n_train_test):
+                if np.min(classes_counts[i]) < 2:
+                    raise ValueError("The least populated class in y has only 1 "
+                                     "member, which is too few. The minimum "
+                                     "number of groups for any class cannot "
+                                     "be less than 2.")
 
-            train = [[] for _ in X_list]
-            test = [[] for _ in X_list]
+                if n_train < n_classes[i]:
+                    raise ValueError('The train_size = %d should be greater or '
+                                     'equal to the number of classes = %d'
+                                     % (n_train, n_classes[i]))
+                
+                if n_test < n_classes[i]:
+                    raise ValueError('The test_size = %d should be greater or '
+                                     'equal to the number of classes = %d'
+                                     % (n_test, n_classes[i]))
 
-            for i, (classes, _) in enumerate(class_info):
-                for j, class_j in enumerate(classes):
-                    permutation = rng.permutation(classes_counts[i][j])
-                    perm_indices_class_j = np.where(
-                        (y_list[i] == class_j))[0][permutation]
-                    train[i].extend(perm_indices_class_j[:n_is[i][j]])
-                    test[i].extend(
-                        perm_indices_class_j[n_is[i][j]:n_is[i][j]
-                                             + t_is[i][j]])
-                train[i] = rng.permutation(train[i])
-                test[i] = rng.permutation(test[i])
+            # generates random training and testing cohorts
+            rng = check_random_state(self.random_state)
+            for _ in range(self.n_splits):
+                n_is = [_approximate_mode(class_counts, n_train, rng)
+                        for class_counts, (n_train, _)
+                        in zip(classes_counts, n_train_test)]
+                classes_counts_remaining = [class_counts - n_i
+                                           for class_counts, n_i
+                                            in zip(classes_counts, n_is)]
+                t_is = [_approximate_mode(class_counts_remaining, n_test, rng)
+                        for class_counts_remaining, (_, n_test)
+                        in zip(classes_counts_remaining, n_train_test)]
 
-            yield train, test
+                train = [[] for _ in expr]
+                test = [[] for _ in expr]
 
-    def split(self, X_list, y_list=None, groups=None):
-        y_list = [check_array(y, ensure_2d=False, dtype=None)
-                  for y in y_list]
-        return super(
-            MultiStratifiedShuffleSplit, self).split(X_list, y_list, groups)
+                for i, (classes, _) in enumerate(class_info):
+                    for j, class_j in enumerate(classes):
+                        permutation = rng.permutation(classes_counts[i][j])
+                        perm_indices_class_j = np.where(
+                            (mut[i] == class_j))[0][permutation]
+                        train[i].extend(perm_indices_class_j[:n_is[i][j]])
+                        test[i].extend(
+                            perm_indices_class_j[n_is[i][j]:n_is[i][j]
+                                                 + t_is[i][j]])
+                    train[i] = rng.permutation(train[i])
+                    test[i] = rng.permutation(test[i])
+
+                yield train, test
+
+    def split(self, expr, mut=None, groups=None):
+        if not hasattr(expr, 'shape'):
+            mut = [check_array(y, ensure_2d=False, dtype=None)
+                      for y in mut]
+        else:
+            mut = check_array(mut, ensure_2d=False, dtype=None)
+
+        expr, mut, groups = indexable(expr, mut, groups)
+        return self._iter_indices(expr, mut, groups)
 
 
