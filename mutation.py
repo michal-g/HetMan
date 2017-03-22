@@ -6,6 +6,8 @@ This file contains classes for representing mutation subtypes in
 formats that facilitate classification of mutation sub-types.
 """
 
+from pipelines import ClassPipe, RegrPipe
+
 import pandas as pd
 
 from re import sub as gsub
@@ -20,7 +22,11 @@ from sklearn.cluster import MeanShift
 
 
 # .. supported mutation levels ..
-MutLevel = Enum('MutLevel', 'Gene Form PolyPhen GISTIC Exon Protein')
+MutLevel = Enum('MutLevel', 'Gene Type Form PolyPhen GISTIC Exon Protein')
+
+
+class HetManMutError(Exception):
+    pass
 
 
 class MuTree(object):
@@ -63,13 +69,30 @@ class MuTree(object):
         The branches at this level of the hierarchy, i.e. the set of genes, set
         of possible consequences, etc.
     """
+
     # .. functions for parsing various levels of mutation properties
     def _muts_gene(muts):
-        return muts
+        new_muts = {gene:mut for gene,mut in muts.groupby('Gene')}
+        return new_muts
+
+    def _muts_type(muts):
+        new_muts = {}
+        cnv_indx = muts['Form'].isin(['Gain', 'Loss'])
+        indel_indx = muts['Protein'].str.contains('ins|del') == True
+        point_indx = muts['Protein'].str.contains(
+            '^p\\.[A-Z][0-9]+[A-Z]$') == True
+        other_indx = ~(cnv_indx | indel_indx | point_indx)
+
+        new_muts['CNV'] = muts.loc[cnv_indx, :]
+        new_muts['InDel'] = muts.loc[indel_indx, :]
+        new_muts['Point'] = muts.loc[point_indx, :]
+        new_muts['Other'] = muts.loc[other_indx, :]
+        return new_muts
     
     def _muts_form(muts):
-        muts.loc[:,'Form'] = muts.loc[:,'Form'].str.replace('_(Del|Ins)$', '')
-        return muts
+        muts['Form'].str.replace('_(Del|Ins)$', '')
+        new_muts = {form:mut for form,mut in muts.groupby('Form')}
+        return new_muts
 
     def _muts_polyphen(muts):
         mshift = MeanShift(bandwidth=exp(-3))
@@ -80,6 +103,15 @@ class MuTree(object):
         return muts
 
     def _muts_gistic(muts):
+        if all(muts['GISTIC'].isnull()):
+            new_muts = {None: muts}
+        else:
+            scrs = muts.loc[:, 'GISTIC']
+            scrs.index = muts.loc[:, 'Sample']
+            new_muts = {'Scores': scrs}
+        return new_muts
+
+    def _muts_gistic_cluster(muts):
         mshift = MeanShift(bandwidth=exp(-2))
         mshift.fit(pd.DataFrame(muts['GISTIC']))
         clust_vec = ['GISTIC_' + str(round(mshift.cluster_centers_[x,0], 2))
@@ -91,11 +123,16 @@ class MuTree(object):
         return muts
 
     def _muts_protein(muts):
-        return muts
+        if all(muts['Protein'].isnull()):
+            new_muts = {None: muts}
+        else:
+            new_muts = {prot:mut for prot,mut in muts.groupby('Protein')}
+        return new_muts
 
     # maps mutation data parsing functions to mutation levels
     mut_fxs = {
         MutLevel.Gene: _muts_gene,
+        MutLevel.Type: _muts_type,
         MutLevel.Form: _muts_form,
         MutLevel.PolyPhen: _muts_polyphen,
         MutLevel.GISTIC: _muts_gistic,
@@ -103,46 +140,34 @@ class MuTree(object):
         MutLevel.Protein: _muts_protein
         }
 
-    def __init__(self,
-                 muts, levels=('Gene', 'Form', 'Protein'),
-                 samples=None, genes=None, depth=0):
+    def __init__(self, muts, levels=('Gene', 'Form'), depth=0):
         self.levels = [MutLevel[lvl] for lvl in levels]
         self.depth = depth
         self.cur_level = MutLevel[levels[depth]]
 
-        # gets subset of mutation data corresponding to requested gene(s)
-        if genes is None:
-            genes = set(muts['Gene'])
-        else:
-            gene_indx = [g in genes for g in muts['Gene']]
-            muts = muts.ix[gene_indx, ]
-
-        # gets subset of mutation data corresponding to requested samples
-        if samples is None:
-            samples = set(muts['Sample'])
-        else:
-            samples = set(muts['Sample']) & set(samples)
-            samp_indx = [s in samples for s in muts['Sample']]
-            muts = muts.ix[samp_indx, ]
-
         # recursively builds the mutation hierarchy
-        muts = MuTree.mut_fxs[self.cur_level](muts)
+        new_muts = MuTree.mut_fxs[self.cur_level](muts)
         self.child = {}
-        for nm, mut in muts.groupby(self.cur_level.name):
-            next_level = None
-            if depth < (len(levels) - 1):
-                for lvl in levels[(depth + 1):]:
-                    if not all([x|y for x,y in
-                                zip(mut[lvl].isin(['.']),
-                                    mut[lvl].isnull())]):
-                        next_level = lvl
-                        break
-            if next_level is None:
-                self.child[nm] = frozenset(mut['Sample'])
-            else:
-                self.child[nm] = MuTree(
-                    muts=mut, levels=levels, samples=samples,
-                    genes=None, depth=levels.index(next_level))
+        for nm, mut in new_muts.items():
+            if mut.shape[0] > 0:
+                new_dp = depth + 1
+                found_lvl = False
+                while new_dp < len(levels) and not found_lvl:
+                    sub_tree = MuTree(muts=mut,
+                                      levels=levels, depth=new_dp)
+                    if len(sub_tree.child) > 1:
+                        self.child[nm] = sub_tree
+                        found_lvl = True
+                    elif tuple(sub_tree.child.keys())[0] == 'Scores':
+                        self.child[nm] = list(sub_tree.child.values())[0]
+                        found_lvl = True
+                    else:
+                        new_dp += 1
+                if not found_lvl:
+                    if len(mut.shape) == 1:
+                        self.child[nm] = mut
+                    else:
+                        self.child[nm] = frozenset(mut['Sample'])
 
     def __str__(self):
         """Printing a MuTree shows each of the branches of the tree and
@@ -156,9 +181,12 @@ class MuTree(object):
             else:
                 if len(v) > 10:
                     new_str = new_str + ': (' + str(len(v)) + ' samples)'
-                else:
+                elif isinstance(v, frozenset):
                     new_str = (new_str + ': '
                                + reduce(lambda x,y: x + ',' + y, tuple(v)))
+                else:
+                    new_str = (new_str + ': '
+                               + reduce(lambda x,y: x + ',' + y, v.index))
             new_str = new_str + '\n' + '\t'*self.depth
         new_str = gsub('\n$', '', new_str)
         return new_str
@@ -173,9 +201,24 @@ class MuTree(object):
         for v in list(self.child.values()):
             if isinstance(v, MuTree):
                 samps |= v.get_samples()
-            else:
+            elif isinstance(v, frozenset):
                 samps |= v
+            else:
+                samps |= set(v.index)
         return samps
+
+    def get_scores(self):
+        """Gets all the sample scores contained within the tree."""
+        scores = {}
+        for v in list(self.child.values()):
+            if isinstance(v, MuTree):
+                scores = {**scores, **v.get_scores()}
+            elif isinstance(v, frozenset):
+                pass
+            else:
+                new_vals = {s:round(vl,3) for s,vl in dict(v).items()}
+                scores = {**scores, **new_vals}
+        return scores
 
     def get_samp_count(self, samps):
         """Gets the number of branches of this tree each of the given
@@ -398,6 +441,29 @@ class MuTree(object):
             mtype = MuType(self.allkey())
         samp_list = mtype.get_samples(self)
         return [s in samp_list for s in samples]
+
+    def scores(self, samples, mtype=None):
+        """For a given set of samples and a MuType, finds the mutation score
+           for each sample if applicable (zero otherwise).
+        """
+        if mtype is None:
+            mtype = MuType(self.allkey())
+        score_list = mtype.get_scores(self)
+        return [score_list[samp] if samp in score_list else 0
+                for samp in samples]
+
+    def mut_vec(self, clf, samples, mtype=None):
+        """Gets the appropriate mutation output vector corresponding to the
+           classifier.
+        """
+        if isinstance(clf, ClassPipe):
+            muts = self.status(samples, mtype)
+        elif isinstance(clf, RegrPipe):
+            muts = self.scores(samples, mtype)
+        else:
+            raise HetManMutError("Classifier must be either a ClassPipe "
+                                 "or a RegrPipe!")
+        return muts
 
 
 class MutSet(object):
@@ -834,10 +900,40 @@ class MuType(object):
                         if k in l:
                             if isinstance(v, frozenset):
                                 samps |= v
-                            elif w is None:
-                                samps |= v.get_samples()
+                            elif isinstance(v, MuTree):
+                                if w is None:
+                                    samps |= v.get_samples()
+                                else:
+                                    samps |= w.get_samples(v)
                             else:
-                                samps |= w.get_samples(v)
+                                samps |= set(v.index)
+        return samps
+
+    def get_scores(self, mtree):
+        """Gets the mutation score (i.e. GISTIC)"""
+        samps = {}
+        if self.level_ in mtree.levels:
+            if self.level_ is not mtree.cur_level:
+                for v in mtree.child.values():
+                    if isinstance(v, MuTree):
+                        samps = {**samps, **self.get_scores(v)}
+                    elif isinstance(v, frozenset):
+                        samps = {**samps, **{s:1 for s in v}}
+                    else:
+                        samps = {**samps, **{s:v[s] for s in v.index}}
+            else:
+                for k,v in mtree.child.items():
+                    for l,w in self.child.items():
+                        if k in l:
+                            if isinstance(v, MuTree):
+                                if w is None:
+                                    samps = {**samps, **v.get_scores()}
+                                else:
+                                    samps = {**samps, **w.get_scores(v)}
+                            elif isinstance(v, frozenset):
+                                samps = {**samps, **{s:1 for s in v}}
+                            else:
+                                samps = {**samps, **{s:v[s] for s in v.index}}
         return samps
 
     def invert(self, mtree):

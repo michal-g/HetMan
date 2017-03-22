@@ -8,8 +8,6 @@ downloaded from sources such as TCGA, ICGC, and Firehose.
 
 # Author: Michal Grzadkowski <grzadkow@ohsu.edu>
 
-from mutation import MutLevel
-
 import numpy as np
 import pandas as pd
 
@@ -163,7 +161,7 @@ def get_expr_icgc(expr_file):
 
 
 # .. functions for reading in simple mutation datasets ..
-def get_mut_mc3(syn, mut_levels=('Gene', 'Form', 'Exon')):
+def get_mut_mc3(syn):
     """Reads ICGC mutation data from the MC3 synapse file.
 
     Parameters
@@ -181,33 +179,19 @@ def get_mut_mc3(syn, mut_levels=('Gene', 'Form', 'Exon')):
         A mutation array, with a row for each mutation appearing in an
         individual sample.
     """
-    # columns in the MC3 file containing each level in the mutation hierarchy
-    mut_cols = {
-        MutLevel.Gene: 0,
-        MutLevel.Form: 8,
-        MutLevel.PolyPhen: 72,
-        MutLevel.Exon: 38,
-        MutLevel.Protein: 36
-        }
 
     # gets data from Synapse, figures out which columns to use
     mc3 = syn.get('syn7824274')
-    data_names = ['Sample'] + list(mut_levels)
-    use_cols = [15]
-    for lvl in mut_levels:
-        use_cols.append(mut_cols[MutLevel[lvl]])
-    data_names = np.array(data_names)[np.array(use_cols).argsort()]
+    use_cols = [0, 8, 15, 36, 38, 72]
+    use_names = ['Gene', 'Form', 'Sample', 'Protein', 'Exon', 'PolyPhen']
 
     # imports data into a DataFrame, parses TCGA sample barcodes
     # and PolyPhen scores
-    muts = pd.read_csv(
-        mc3.path, usecols=use_cols, sep='\t', header=None,
-        names=data_names, comment='#', skiprows=1)
+    muts = pd.read_csv(mc3.path, usecols=use_cols, sep='\t', header=None,
+                       names=use_names, comment='#', skiprows=1)
     muts['Sample'] = parse_tcga_barcodes(muts['Sample'])
-    if 'PolyPhen' in mut_levels:
-        muts['PolyPhen'] = [gsub('\)$', '', gsub('^.*\(', '', x))
-                            if x != '.' else 0
-                            for x in muts['PolyPhen']]
+    muts['PolyPhen'] = [gsub('\)$', '', gsub('^.*\(', '', x))
+                        if x != '.' else 0 for x in muts['PolyPhen']]
 
     return muts
 
