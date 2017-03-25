@@ -16,6 +16,7 @@ from selection import PathwaySelect
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import ElasticNet as ENet
 from sklearn.svm import SVR
+from sklearn.ensemble import RandomForestRegressor
 
 
 class ElasticNet(RegrPipe):
@@ -51,7 +52,26 @@ class SVRrbf(RegrPipe):
         feat_step = PathwaySelect(path_keys=path_keys)
         norm_step = StandardScaler()
         fit_step = SVR(kernel='rbf', cache_size=500)
-        UniPipe.__init__(self,
+        RegrPipe.__init__(self,
+            [('feat', feat_step), ('norm', norm_step), ('fit', fit_step)],
+            path_keys)
+
+
+class rForest(RegrPipe):
+    """A class corresponding to Random Forest regression
+       of gene gain/loss status.
+    """
+
+    tune_priors = (
+        ('fit__min_samples_leaf', (0.001,0.005,0.01,0.05)),
+        ('fit__max_features', (5, 'sqrt', 'log2', 0.02))
+        )
+
+    def __init__(self, path_keys=None):
+        feat_step = PathwaySelect(path_keys=path_keys)
+        norm_step = StandardScaler()
+        fit_step = RandomForestRegressor(n_estimators=1000)
+        RegrPipe.__init__(self,
             [('feat', feat_step), ('norm', norm_step), ('fit', fit_step)],
             path_keys)
 

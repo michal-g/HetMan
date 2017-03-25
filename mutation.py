@@ -70,109 +70,126 @@ class MuTree(object):
         of possible consequences, etc.
     """
 
-    # .. functions for parsing various levels of mutation properties
-    def _muts_gene(muts):
-        new_muts = {gene:mut for gene,mut in muts.groupby('Gene')}
-        return new_muts
+    # mapping between mutation levels and custom mutation levels
+    mut_fields = {
+        'Type': ['Gene', 'Form', 'Protein']
+        }
 
-    def _muts_type(muts):
+    # .. functions for parsing various levels of mutation properties ..
+    @classmethod
+    def check_muts(cls, muts, levels):
+        muts_left = False
+        lvls_left = levels
+        while lvls_left and not muts_left:
+            cur_lvl = lvls_left.pop(0).split('_')[0]
+            if cur_lvl in muts:
+                muts_left = not all(pd.isnull(muts[cur_lvl]))
+            else:
+                muts_left = not all(pd.isnull(
+                    muts.loc[:, cls.mut_fields[cur_lvl]]))
+
+        return muts_left
+
+    @classmethod
+    def parse_muts(cls, muts, lvl_name):
+        lvl_info = lvl_name.split('_')
+        if len(lvl_info) > 2:
+            raise HetManMutError("Invalid level name " + lvl_name
+                                 + " with more than two fields!")
+        elif len(lvl_info) == 2:
+            parse_lbl = lvl_info[-1]
+            if ('parse_' + parse_lbl) not in cls.__dict__:
+                raise HetManMutError("Unknown parse label " + parse_lbl + "!")
+            else:
+                muts = eval('cls.parse_' + parse_lbl)(muts, lvl_info[0])
+
+        if isinstance(muts, tuple):
+            pass
+        elif lvl_info[0] in muts:
+            muts = dict(tuple(muts.groupby(lvl_name)))
+        elif lvl_info[0] not in cls.mut_fields:
+            raise HetManMutError("Unknown mutation level " + lvl_info[0]
+                                 + " which is not in the given mutation data "
+                                 "frame nor in the list of custom levels!")
+        elif not all([x in muts for x in cls.mut_fields[lvl_info[0]]]):
+            raise HetManMutError("For mutation level " + lvl_info[0] + ", "
+                                 + str(cls.mut_fields[lvl_info[0]]) + " need "
+                                 "to be provided as fields in the input.")
+        else:
+            muts = eval('cls.muts_' + lvl_name.lower())(muts)
+
+        return muts
+
+    @staticmethod
+    def muts_type(muts):
         new_muts = {}
         cnv_indx = muts['Form'].isin(['Gain', 'Loss'])
-        indel_indx = muts['Protein'].str.contains('ins|del') == True
-        point_indx = muts['Protein'].str.contains(
-            '^p\\.[A-Z][0-9]+[A-Z]$') == True
-        other_indx = ~(cnv_indx | indel_indx | point_indx)
+        point_indx = muts['Protein'].str.match(
+            pat='^p\\.[A-Z][0-9]+[A-Z]$', as_indexer=True, na=False)
+        frame_indx = muts['Protein'].str.match(
+            pat='^p\\..*(?:\\*|(?:ins|del))', as_indexer=True, na=False)
+        other_indx = ~(cnv_indx | point_indx | frame_indx)
 
         new_muts['CNV'] = muts.loc[cnv_indx, :]
-        new_muts['InDel'] = muts.loc[indel_indx, :]
         new_muts['Point'] = muts.loc[point_indx, :]
+        new_muts['Frame'] = muts.loc[frame_indx, :]
         new_muts['Other'] = muts.loc[other_indx, :]
         return new_muts
     
-    def _muts_form(muts):
-        muts['Form'].str.replace('_(Del|Ins)$', '')
-        new_muts = {form:mut for form,mut in muts.groupby('Form')}
+    @staticmethod
+    def parse_base(muts, parse_lvl):
+        new_muts = muts.replace(to_replace={parse_lvl: {'_(Del|Ins)$': ''}},
+                                regex=True, inplace=False)
         return new_muts
 
-    def _muts_polyphen(muts):
+    @staticmethod
+    def parse_clust(muts, parse_lvl):
         mshift = MeanShift(bandwidth=exp(-3))
-        mshift.fit(pd.DataFrame(muts['PolyPhen']))
-        clust_vec = ['PolyPhen_' + str(round(mshift.cluster_centers_[x,0], 2))
+        mshift.fit(pd.DataFrame(muts[parse_lvl]))
+        clust_vec = [(parse_lvl + '_'
+                      + str(round(mshift.cluster_centers_[x,0], 2)))
                      for x in mshift.labels_]
-        muts['PolyPhen'] = clust_vec
+        muts[parse_lvl] = clust_vec
         return muts
 
-    def _muts_gistic(muts):
-        if all(muts['GISTIC'].isnull()):
-            new_muts = {None: muts}
+    @staticmethod
+    def parse_scores(muts, parse_lvl):
+        return tuple(zip(muts['Sample'], muts[parse_lvl]))
+
+
+    def __new__(cls, muts, levels=('Gene', 'Form'), depth=0):
+        new_muts = cls.check_muts(muts, levels[depth:])
+        if new_muts:
+            return super(MuTree, cls).__new__(cls)
         else:
-            scrs = muts.loc[:, 'GISTIC']
-            scrs.index = muts.loc[:, 'Sample']
-            new_muts = {'Scores': scrs}
-        return new_muts
-
-    def _muts_gistic_cluster(muts):
-        mshift = MeanShift(bandwidth=exp(-2))
-        mshift.fit(pd.DataFrame(muts['GISTIC']))
-        clust_vec = ['GISTIC_' + str(round(mshift.cluster_centers_[x,0], 2))
-                     for x in mshift.labels_]
-        muts['GISTIC'] = clust_vec
-        return muts
-
-    def _muts_exon(muts):
-        return muts
-
-    def _muts_protein(muts):
-        if all(muts['Protein'].isnull()):
-            new_muts = {None: muts}
-        else:
-            new_muts = {prot:mut for prot,mut in muts.groupby('Protein')}
-        return new_muts
-
-    # maps mutation data parsing functions to mutation levels
-    mut_fxs = {
-        MutLevel.Gene: _muts_gene,
-        MutLevel.Type: _muts_type,
-        MutLevel.Form: _muts_form,
-        MutLevel.PolyPhen: _muts_polyphen,
-        MutLevel.GISTIC: _muts_gistic,
-        MutLevel.Exon: _muts_exon,
-        MutLevel.Protein: _muts_protein
-        }
+            return frozenset(muts['Sample'])
 
     def __init__(self, muts, levels=('Gene', 'Form'), depth=0):
-        self.levels = [MutLevel[lvl] for lvl in levels]
-        self.depth = depth
-        self.cur_level = MutLevel[levels[depth]]
+        self.levels = levels
 
         # recursively builds the mutation hierarchy
-        new_muts = MuTree.mut_fxs[self.cur_level](muts)
+        lvls_left = levels[depth:]
         self.child = {}
-        for nm, mut in new_muts.items():
-            if mut.shape[0] > 0:
-                new_dp = depth + 1
-                found_lvl = False
-                while new_dp < len(levels) and not found_lvl:
-                    sub_tree = MuTree(muts=mut,
-                                      levels=levels, depth=new_dp)
-                    if len(sub_tree.child) > 1:
-                        self.child[nm] = sub_tree
-                        found_lvl = True
-                    elif tuple(sub_tree.child.keys())[0] == 'Scores':
-                        self.child[nm] = list(sub_tree.child.values())[0]
-                        found_lvl = True
-                    else:
-                        new_dp += 1
-                if not found_lvl:
-                    if len(mut.shape) == 1:
-                        self.child[nm] = mut
-                    else:
-                        self.child[nm] = frozenset(mut['Sample'])
+        cur_depth = depth
+
+        while lvls_left and not self.child:
+            cur_lvl = lvls_left.pop(0)
+            parsed_muts = self.parse_muts(muts, cur_lvl)
+            if parsed_muts:
+                self.depth = cur_depth
+                self.cur_level = levels[cur_depth]
+                if isinstance(parsed_muts, tuple):
+                    self.child = dict(parsed_muts)
+                else:
+                    for nm, mut in parsed_muts.items():
+                        self.child[nm] = MuTree(mut, levels, cur_depth+1)
+            else:
+                cur_depth += 1
 
     def __str__(self):
         """Printing a MuTree shows each of the branches of the tree and
            the samples at the end of each branch."""
-        new_str = self.cur_level.name
+        new_str = self.cur_level
         for k,v in self.child.items():
             new_str = new_str + ' IS ' + k
             if isinstance(v, MuTree):
@@ -279,8 +296,8 @@ class MuTree(object):
             levels = [lvl.name for lvl in self.levels]
         if not levels:
             new_key = None
-        elif self.cur_level.name in levels:
-            cur_indx = levels.index(self.cur_level.name)
+        elif self.cur_level in levels:
+            cur_indx = levels.index(self.cur_level)
             new_lvls = levels[:cur_indx] + levels[(cur_indx+1):]
             new_key = {(self.cur_level, k):
                        v.allkey(new_lvls) if isinstance(v, MuTree)
@@ -316,13 +333,13 @@ class MuTree(object):
             mtype = MuType(self.allkey(levels))
         if levels is None:
             levels = [lvl.name for lvl in self.levels]
-        if self.cur_level.name in levels:
+        if self.cur_level in levels:
             mtypes = []
             for k,v in self.child.items():
                 for l,w in mtype.child.items():
                     if k in l:
                         new_lvls = list(
-                            set(levels) - set([self.cur_level.name]))
+                            set(levels) - set([self.cur_level]))
                         if isinstance(v, MuTree) and len(new_lvls) > 0:
                             mtypes += [MuType({(self.cur_level, k):s})
                                        for s in v.subsets(w, new_lvls)]

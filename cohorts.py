@@ -322,7 +322,7 @@ class Cohort(object):
             fit_params={'feat__mut_genes': list(
                 reduce(lambda x,y: x|y, mtype.child.keys())),
                         'feat__path_obj': self.path_},
-            scoring=clf.score_auc, cv=score_cvs, n_jobs=-1
+            scoring=clf.score_mut, cv=score_cvs, n_jobs=-1
             ), 25)
 
         return cv_score

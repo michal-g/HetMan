@@ -2,8 +2,8 @@
 """
 Hetman (Heterogeneity Manifold)
 Classification of mutation sub-types using expression data.
-This file contains functions for reading in transcriptomic and genomic data
-downloaded from sources such as TCGA, ICGC, and Firehose.
+This file contains functions for loading and processing -omic data downloaded
+from sources such as TCGA, ICGC, and Firehose.
 """
 
 # Author: Michal Grzadkowski <grzadkow@ohsu.edu>
@@ -28,7 +28,7 @@ class HetManDataError(Exception):
     pass
 
 
-# .. helper functions for parsing -omic datasets ..
+# .. helper functions for parsing datasets ..
 def parse_tcga_barcodes(barcodes):
     """Extracts the sample labels from TCGA barcodes."""
     return [reduce(lambda x,y: x + '-' + y,
