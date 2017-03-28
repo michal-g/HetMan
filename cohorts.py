@@ -9,7 +9,7 @@ testing classifiers.
 # Author: Michal Grzadkowski <grzadkow@ohsu.edu>
 
 from data import *
-from mutation import MutLevel, MuTree
+from mutation import MuTree
 
 import numpy as np
 import pandas as pd

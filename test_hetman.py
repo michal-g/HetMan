@@ -4,11 +4,12 @@ import numpy as np
 import pandas as pd
 import pickle
 import sys
+import synapseclient
 
 sys.path += ['/home/users/grzadkow/compbio/scripts/HetMan']
 from mutation import *
 from cohorts import Cohort
-import classif
+import classifiers
 
 from itertools import combinations as combn
 
@@ -43,6 +44,8 @@ def mtypes_small():
 
 @pytest.fixture(scope='module')
 def cdata_small():
+    syn = synapseclient.Synapse()
+    syn.login('grzadkow', 'W0w6g1i8A')
     return Cohort(syn, cohort='COAD', mut_genes=['BRAF','TP53','PIK3CA'],
                   mut_levels=('Gene', 'Form', 'Protein'))
 
@@ -83,42 +86,42 @@ class TestCaseBasicMuTree:
         key2 = mtree_small.allkey(['Gene','Form'])
         key3 = mtree_small.allkey()
         key4 = mtree_small.allkey(['Gene','Exon'])
-        assert key1 == {(MutLevel.Gene, 'CDH1'): None,
-                        (MutLevel.Gene, 'TTN'): None}
-        assert key2 == {(MutLevel.Gene, 'CDH1'):
-                        {(MutLevel.Form, 'Silent'): None},
-                        (MutLevel.Gene, 'TTN'):
-                        {(MutLevel.Form, 'Missense_Mutation'): None,
-                         (MutLevel.Form, 'Silent'): None}}
-        assert key3 == {(MutLevel.Gene, 'CDH1'):
-                        {(MutLevel.Form, 'Silent'):
-                         {(MutLevel.Exon, '7/16'): None}},
-                        (MutLevel.Gene, 'TTN'):
-                        {(MutLevel.Form, 'Missense_Mutation'):
-                         {(MutLevel.Exon, '10/363'): None,
-                          (MutLevel.Exon, '133/363'): None,
-                          (MutLevel.Exon, '232/363'): None,
-                          (MutLevel.Exon, '256/363'): None,
-                          (MutLevel.Exon, '280/363'): None,
-                          (MutLevel.Exon, '284/363'): None,
-                          (MutLevel.Exon, '302/363'): None,
-                          (MutLevel.Exon, '326/363'): None,
-                          (MutLevel.Exon, '46/363'): None},
-                         (MutLevel.Form, 'Silent'):
-                         {(MutLevel.Exon, '26/363'): None}}}
-        assert key4 == {(MutLevel.Gene, 'CDH1'):
-                        {(MutLevel.Exon, '7/16'): None},
-                        (MutLevel.Gene, 'TTN'):
-                        {(MutLevel.Exon, '10/363'): None,
-                         (MutLevel.Exon, '133/363'): None,
-                         (MutLevel.Exon, '232/363'): None,
-                         (MutLevel.Exon, '256/363'): None,
-                         (MutLevel.Exon, '26/363'): None,
-                         (MutLevel.Exon, '280/363'): None,
-                         (MutLevel.Exon, '284/363'): None,
-                         (MutLevel.Exon, '302/363'): None,
-                         (MutLevel.Exon, '326/363'): None,
-                         (MutLevel.Exon, '46/363'): None}}
+        assert key1 == {('Gene', 'CDH1'): None,
+                        ('Gene', 'TTN'): None}
+        assert key2 == {('Gene', 'CDH1'):
+                        {('Form', 'Silent'): None},
+                        ('Gene', 'TTN'):
+                        {('Form', 'Missense_Mutation'): None,
+                         ('Form', 'Silent'): None}}
+        assert key3 == {('Gene', 'CDH1'):
+                        {('Form', 'Silent'):
+                         {('Exon', '7/16'): None}},
+                        ('Gene', 'TTN'):
+                        {('Form', 'Missense_Mutation'):
+                         {('Exon', '10/363'): None,
+                          ('Exon', '133/363'): None,
+                          ('Exon', '232/363'): None,
+                          ('Exon', '256/363'): None,
+                          ('Exon', '280/363'): None,
+                          ('Exon', '284/363'): None,
+                          ('Exon', '302/363'): None,
+                          ('Exon', '326/363'): None,
+                          ('Exon', '46/363'): None},
+                         ('Form', 'Silent'):
+                         {('Exon', '26/363'): None}}}
+        assert key4 == {('Gene', 'CDH1'):
+                        {('Exon', '7/16'): None},
+                        ('Gene', 'TTN'):
+                        {('Exon', '10/363'): None,
+                         ('Exon', '133/363'): None,
+                         ('Exon', '232/363'): None,
+                         ('Exon', '256/363'): None,
+                         ('Exon', '26/363'): None,
+                         ('Exon', '280/363'): None,
+                         ('Exon', '284/363'): None,
+                         ('Exon', '302/363'): None,
+                         ('Exon', '326/363'): None,
+                         ('Exon', '46/363'): None}}
 
     def test_subsets(self, mtree_small, mtypes_small):
         """Can we get the subsets of a MuType with a MuTree?"""
@@ -207,14 +210,14 @@ class TestCaseCohort:
     def test_clf(self, cdata_small):
         """Can we use a classifier on a Cohort?"""
         mtype = MuType({('Gene', 'BRAF'):{('Protein', 'p.V600E'): None}})
-        clf = classif.Lasso()
+        clf = classifiers.Lasso()
         old_C = clf.named_steps['fit'].C
 
-        cdata.tune_clf(clf, mtype=mtype)
+        cdata_small.tune_clf(clf, mtype=mtype)
         assert clf.named_steps['fit'].C != old_C
-        cdata.score_clf(clf, mtype=mtype)
-        cdata.fit_clf(clf, mtype=mtype)
-        cdata.predict_clf(clf, use_test=False)
-        cdata.eval_clf(clf, mtype=mtype)
+        cdata_small.score_clf(clf, mtype=mtype)
+        cdata_small.fit_clf(clf, mtype=mtype)
+        cdata_small.predict_clf(clf, use_test=False)
+        cdata_small.eval_clf(clf, mtype=mtype)
 
 
