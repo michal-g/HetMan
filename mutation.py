@@ -5,6 +5,8 @@ Classification of mutation sub-types using expression data.
 This file contains classes for representing and storing mutation sub-types.
 """
 
+# Author: Michal Grzadkowski <grzadkow@ohsu.edu>
+
 from pipelines import ClassPipe, RegrPipe
 
 import pandas as pd
@@ -204,7 +206,22 @@ class MuTree(object):
 
     def __getitem__(self, key):
         """Gets a particular category of mutations at the current level."""
-        return self.child[key]
+        if not key:
+            key_item = self
+        elif isinstance(key, str):
+            key_item = self.child[key]
+        elif hasattr(key, '__getitem__'):
+            sub_item = self.child[key[0]]
+            if isinstance(sub_item, MuTree):
+                key_item = sub_item[key[1:]]
+            elif key[1:]:
+                raise KeyError("Key has more levels than this MuTree!")
+            else:
+                key_item = sub_item
+        else:
+            raise TypeError("Unsupported key type " + type(key) + "!")
+
+        return key_item
 
     def __str__(self):
         """Printing a MuTree shows each of the branches of the tree and
@@ -312,21 +329,32 @@ class MuTree(object):
         """
         if levels is None:
             levels = self.levels
+
         if self.cur_level in levels:
             cur_indx = levels.index(self.cur_level)
             new_lvls = levels[:cur_indx] + levels[(cur_indx+1):]
             new_key = {
-                ((self.cur_level, round(mut, 5))
-                 if '_scores' in self.cur_level
+                ((self.cur_level, mut) if '_scores' in self.cur_level
                  else (self.cur_level, nm)):
-                (mut.allkey(new_lvls) if isinstance(mut, MuTree) else None)
+                (mut.allkey(new_lvls) if isinstance(mut, MuTree) and new_lvls
+                 else None)
                 for nm,mut in self
                 }
+
         else:
-            new_key = reduce(lambda x,y: {**x,**y},
-                             [mut.allkey(levels) if isinstance(mut, MuTree)
-                              else {round(mut, 5):None}
-                              for nm, mut in self])
+            new_key = reduce(
+                lambda x,y: dict(
+                    tuple(x.items()) + tuple(y.items())
+                    + tuple((k, None) if x[k] is None
+                            else (k, {**x[k], **y[k]})
+                            for k in set(x) & set(y))),
+                [mut.allkey(levels) if isinstance(mut, MuTree)
+                 else {(self.cur_level, mut):None}
+                 if '_scores' in self.cur_level
+                 else {(self.cur_level, nm):None}
+                 for nm, mut in self]
+                )
+
         return new_key
 
     def subsets(self, mtype=None, levels=None):
@@ -745,7 +773,7 @@ class MuType(object):
             new_str += '\nOR '
         return gsub('\nOR $', '', new_str)
 
-    def _raw_key(self):
+    def raw_key(self):
         "Returns the expanded key of a MuType."
         rmembs = reduce(lambda x,y: x|y, list(self.child.keys()))
         return {memb:reduce(lambda x,y: x|y,

@@ -12,35 +12,56 @@ from cohorts import Cohort
 import classifiers
 
 from itertools import combinations as combn
+from itertools import chain
 
 
 @pytest.fixture(scope='module')
-def muts_small():
-    with open('test/muts_small.p', 'rb') as fl:
-        muts = pickle.load(fl)
-    return muts
+def muts_tester(request):
+    """Create a mutation table."""
+    return MutsTester(request.param)
+
+def muts_id(val):
+    """Get the ID of a file storing test mutation data."""
+    return val[0].split('muts_')[-1].split('.p')[0]
+
+class MutsTester(object):
+    def __init__(self, arg):
+        self.muts_file = arg[0]
+
+    def get_muts_mtree(self, levels=None):
+        with open(self.muts_file, 'rb') as fl:
+            muts = pickle.load(fl)
+        if levels is None:
+            levels = tuple(muts.columns[:-1])
+        mtree = MuTree(muts, levels=levels)
+        return muts, mtree
 
 @pytest.fixture(scope='module')
-def mtree_small(muts_small):
-    return MuTree(muts_small, levels=('Gene','Form','Exon'))
+def type_tester(request):
+    """Create a set of mutation subtypes."""
+    return TypeTester(request.param)
 
-@pytest.fixture(scope='module')
-def mtypes_small():
-    mtype1 = MuType({('Gene', 'TTN'): None})
-    mtype2 = MuType(
-            {('Gene', 'TTN'):
-             {('Form', 'Missense_Mutation'):
-              {('Exon', ('326/363','10/363')): None}}}
-            )
-    mtype3 = MuType(
-            {('Gene', 'CDH1'): None,
-             ('Gene', 'TTN'):
-             {('Form', 'Missense_Mutation'):
-              {('Exon', ('302/363','10/363')): None}}}
-            )
-    mtype4 = MuType({('Form', 'Silent'): None})
-    mtype5 = MuType({('Gene', ('CDH1','TTN')): None})
-    return [mtype1, mtype2, mtype3, mtype4, mtype5]
+class TypeTester(object):
+    # mutation types for each mutation collection
+    mtypes = {'small': (
+        MuType({('Gene', 'TTN'): None}),
+        MuType({('Gene', 'TTN'):
+                {('Form', 'Missense_Mutation'):
+                 {('Exon', ('326/363','10/363')): None}}}),
+        MuType({('Gene', 'CDH1'): None,
+                ('Gene', 'TTN'):
+                {('Form', 'Missense_Mutation'):
+                 {('Exon', ('302/363','10/363')): None}}}),
+        MuType({('Form', 'Silent'): None}),
+        MuType({('Gene', ('CDH1','TTN')): None})
+        )}
+
+    def __init__(self, arg):
+        self.type_lbl = arg[0]
+
+    def get_types(self):
+        return self.mtypes[self.type_lbl]
+
 
 @pytest.fixture(scope='module')
 def cdata_small():
@@ -50,90 +71,131 @@ def cdata_small():
                   mut_levels=('Gene', 'Form', 'Protein'))
 
 
+@pytest.mark.parametrize('muts_tester', [['test/muts_small.p']],
+                         ids=muts_id, indirect=True, scope="class")
 class TestCaseBasicMuTree:
-    """Basic tests for Hetman MuTrees."""
+    """Tests for basic functionality of MuTrees."""
 
-    def test_structure(self, muts_small, mtree_small):
+    def test_keys(self, muts_tester):
+        """Does the tree correctly implement key retrieval of subtrees?"""
+        muts, mtree = muts_tester.get_muts_mtree()
+
+        if len(mtree.levels) > 1:
+            for vals, _ in muts.groupby(mtree.levels):
+                assert mtree.child[vals[0]][vals[1:]] == mtree[vals]
+                assert mtree[vals[:-1]].child[vals[-1]] == mtree[vals]
+        else:
+            for val in set(muts[mtree.levels[0]]):
+                assert mtree.child[val] == mtree[val]
+
+    def test_structure(self, muts_tester):
         """Is the internal structure of the tree correct?"""
-        assert set(list(mtree_small.child.keys())) == set(muts_small['Gene'])
-        assert (set(list(mtree_small.child['TTN'].child.keys()))
-                == set(muts_small['Form'][muts_small['Gene'] == 'TTN']))
+        muts, mtree = muts_tester.get_muts_mtree()
+        assert set(mtree.child.keys()) == set(muts[mtree.levels[0]])
+        assert mtree.depth == 0
 
-    def test_samps(self, muts_small, mtree_small):
-        """Does the tree properly store its samples?"""
-        assert set(muts_small['Sample']) == mtree_small.get_samples()
-        assert (mtree_small.get_samp_count(muts_small['Sample']) ==
-                {k:list(muts_small.drop_duplicates()['Sample']).count(k)
-                 for k in muts_small['Sample']})
+        lvl_sets = {i:mtree.levels[:i] for i in range(1, len(mtree.levels))}
+        for i, lvl_set in lvl_sets.items():
+            for vals, mut in muts.groupby(lvl_set):
+                assert mtree[vals].depth == i
+                assert (set(mtree[vals].child.keys())
+                        == set(mut[mtree.levels[i]]))
 
-    def test_status(self, muts_small, mtree_small, mtypes_small):
-        """Does the tree give the right mutation status?"""
-        samps1 = (["dummy" + str(i) for i in range(3)]
-                  + list(muts_small['Sample'])
-                  + ["dummy" + str(i) for i in range(11,16)])
-        assert (mtree_small.status(samps1)
-                == pd.Series(samps1).isin(muts_small['Sample'])).all()
-        assert (mtree_small.status(samps1, mtypes_small[4])
-                == pd.Series(samps1).isin(muts_small['Sample'])).all()
-
-    def test_print(self, mtree_small):
+    def test_print(self, muts_tester):
         """Can we print the tree?"""
-        print(mtree_small)
+        muts, mtree = muts_tester.get_muts_mtree()
 
-    def test_keys(self, mtree_small):
-        """Can we retrieve the keys of the tree?"""
-        key1 = mtree_small.allkey(['Gene'])
-        key2 = mtree_small.allkey(['Gene','Form'])
-        key3 = mtree_small.allkey()
-        key4 = mtree_small.allkey(['Gene','Exon'])
-        assert key1 == {('Gene', 'CDH1'): None,
-                        ('Gene', 'TTN'): None}
-        assert key2 == {('Gene', 'CDH1'):
-                        {('Form', 'Silent'): None},
-                        ('Gene', 'TTN'):
-                        {('Form', 'Missense_Mutation'): None,
-                         ('Form', 'Silent'): None}}
-        assert key3 == {('Gene', 'CDH1'):
-                        {('Form', 'Silent'):
-                         {('Exon', '7/16'): None}},
-                        ('Gene', 'TTN'):
-                        {('Form', 'Missense_Mutation'):
-                         {('Exon', '10/363'): None,
-                          ('Exon', '133/363'): None,
-                          ('Exon', '232/363'): None,
-                          ('Exon', '256/363'): None,
-                          ('Exon', '280/363'): None,
-                          ('Exon', '284/363'): None,
-                          ('Exon', '302/363'): None,
-                          ('Exon', '326/363'): None,
-                          ('Exon', '46/363'): None},
-                         ('Form', 'Silent'):
-                         {('Exon', '26/363'): None}}}
-        assert key4 == {('Gene', 'CDH1'):
-                        {('Exon', '7/16'): None},
-                        ('Gene', 'TTN'):
-                        {('Exon', '10/363'): None,
-                         ('Exon', '133/363'): None,
-                         ('Exon', '232/363'): None,
-                         ('Exon', '256/363'): None,
-                         ('Exon', '26/363'): None,
-                         ('Exon', '280/363'): None,
-                         ('Exon', '284/363'): None,
-                         ('Exon', '302/363'): None,
-                         ('Exon', '326/363'): None,
-                         ('Exon', '46/363'): None}}
+        print(mtree)
+        lvl_sets = [mtree.levels[:i] for i in range(1, len(mtree.levels))]
+        for lvl_set in lvl_sets:
+            for vals, _ in muts.groupby(lvl_set):
+                print(mtree[vals])
 
-    def test_subsets(self, mtree_small, mtypes_small):
-        """Can we get the subsets of a MuType with a MuTree?"""
-        assert len(mtree_small.subsets()) == 11
-        assert len(mtree_small.subsets(mtypes_small[0])) == 10
-        assert len(mtree_small.subsets(mtypes_small[1])) == 2
+    def test_iteration(self, muts_tester):
+        """Does the tree correctly implement iteration over subtrees?"""
+        muts, mtree = muts_tester.get_muts_mtree()
+
+        for nm, mut in mtree:
+            assert nm in set(muts[mtree.levels[0]])
+            assert mut == mtree[nm]
+            assert mut != mtree
+
+        lvl_sets = {i:mtree.levels[:i] for i in range(1, len(mtree.levels))}
+        for i, lvl_set in lvl_sets.items():
+            for vals, _ in muts.groupby(lvl_set):
+                if isinstance(vals, str):
+                    vals = (vals, )
+                for nm, mut in mtree[vals]:
+                    assert nm in set(muts[mtree.levels[i]])
+                    assert mut == mtree[vals][nm]
+                    assert mut != mtree[vals[:-1]]
+
+    def test_samples(self, muts_tester):
+        """Does the tree properly store its samples?"""
+        muts, mtree = muts_tester.get_muts_mtree()
+
+        for vals, mut in muts.groupby(mtree.levels):
+            assert set(mtree[vals]) == set(mut['Sample'])
+
+    def test_get_samples(self, muts_tester):
+        """Can we successfully retrieve the samples from the tree?"""
+        muts, mtree = muts_tester.get_muts_mtree()
+
+        lvl_sets = [mtree.levels[:i] for i in range(1, len(mtree.levels))]
+        for lvl_set in lvl_sets:
+            for vals, mut in muts.groupby(lvl_set):
+                assert set(mtree[vals].get_samples()) == set(mut['Sample'])
+
+    def test_allkeys(self, muts_tester):
+        """Can we retrieve the mutation set key of the tree?"""
+        muts, mtree = muts_tester.get_muts_mtree()
+
+        assert mtree.allkey() == mtree.allkey(mtree.levels)
+        lvl_sets = chain.from_iterable(
+            combn(mtree.levels, r)
+            for r in range(1, len(mtree.levels)+1))
+        for lvl_set in lvl_sets:
+            lvl_key = {}
+            for vals, _ in muts.groupby(lvl_set):
+                cur_key = lvl_key
+                if isinstance(vals, str):
+                    vals = (vals,)
+                for i in range(len(lvl_set) - 1):
+                    if (lvl_set[i], vals[i]) not in cur_key:
+                        cur_key.update({(lvl_set[i], vals[i]):{}})
+                    cur_key = cur_key[(lvl_set[i], vals[i])]
+                cur_key.update({(lvl_set[-1], vals[-1]):None})
+
+            assert mtree.allkey(lvl_set) == lvl_key
 
 
+@pytest.mark.parametrize('type_tester', [['small']],
+                         indirect=True, scope="class")
 class TestCaseBasicMuType:
-    """Basic tests for Hetman MuTypes."""
+    """Tests for basic functionality of MuTypes."""
 
-    def test_samps(self, muts_small, mtree_small, mtypes_small):
+    def test_print(self, type_tester):
+        """Can we print MuTypes?"""
+        mtypes = type_tester.get_types()
+
+        for mtype in mtypes:
+            print(mtype)
+
+    def test_hash(self, type_tester):
+        """Can we get proper hash values of MuTypes?"""
+        mtypes = type_tester.get_types()
+
+        for mtype1, mtype2 in combn(mtypes, 2):
+            assert (mtype1 == mtype2) == (hash(mtype1) == hash(mtype2))
+
+    def test_rawkey(self, type_tester):
+        """Can we get the raw key of MuTypes?"""
+        mtypes = type_tester.get_types()
+
+        for mtype in mtypes:
+            mtype.raw_key()
+
+    def test_samps(self, type_tester):
         """Can we retrieve the right samples using a MuType?"""
         assert (mtypes_small[4].get_samples(mtree_small)
                 == set(muts_small['Sample']))
@@ -153,17 +215,6 @@ class TestCaseBasicMuType:
         assert (mtypes_small[2].get_samples(mtree_small)
                 == set(muts_small['Sample'][samp_indx]))
 
-    def test_print(self, mtypes_small):
-        """Can we print MuTypes?"""
-        for mtype in mtypes_small:
-            print(mtype)
-
-    def test_hash(self, mtypes_small):
-        """Can we get proper hash values of MuTypes?"""
-        hash_test = [hash(mtype) for mtype in mtypes_small]
-        hash_test2 = [hash(mtype) for mtype in mtypes_small]
-        assert len(set(hash_test)) == len(mtypes_small)
-        assert all([x == y for x,y in zip(hash_test, hash_test2)])
 
 
 class TestCaseMuTypeBinary:

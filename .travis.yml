@@ -9,10 +9,11 @@ install:
         - hash -r
         - conda config --set always_yes yes --set changeps1 no
         - conda update -q conda
+        - conda update conda-env
         - conda install nbformat
         - conda info -a
         - conda env create
         - source activate HetMan
 
-script: pytest -vv test_hetman.py
+script: pytest -vv test_hetman.py::TestCaseBasicMuTree
 
