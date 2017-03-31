@@ -12,8 +12,8 @@ install:
         - conda update conda-env
         - conda install nbformat
         - conda info -a
-        - conda create --file=environment.yml --name HetMan
+        - conda env create
         - source activate HetMan
 
-script: pytest -vv test_hetman.py::TestCaseBasicMuTree
+script: pytest -vv test_hetman.py
 

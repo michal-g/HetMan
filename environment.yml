@@ -1,6 +1,6 @@
 name: HetMan
-PYTHON_PATH: "/home/users/grzadkow/compbio/scripts/HetMan"
 channels:
+- ska
 - defaults
 - conda-forge
 - anaconda
@@ -78,6 +78,14 @@ dependencies:
 - synapseclient=1.5=py35_0
 - requests-cache=0.4.12=py35_0
 - py=1.4.32=py35_0
+- atk=1.28.0=0
+- cairo=1.8.8=0
+- gtk-plus=2.18.3=0
+- pango=1.26.0=0
+- pixman=0.16.2=0
+- pycairo=1.8.8=0
+- pygobject=2.20.0=0
+- pygtk=2.16.0=1
 - pip:
   - dirichlet==0.7
   - firebrowse==0.1.8
@@ -85,3 +93,4 @@ dependencies:
   - prompt-toolkit==1.0.9
   - simplex==0.1.2
 prefix: /home/exacloud/lustre1/BioCoders/Applications/miniconda3/envs/HetMan
+
