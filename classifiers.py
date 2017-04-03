@@ -7,8 +7,8 @@ This file contains the algorithms used to predict discrete mutation states.
 
 # Author: Michal Grzadkowski <grzadkow@ohsu.edu>
 
-from pipelines import ClassPipe
-from selection import PathwaySelect
+from .pipelines import ClassPipe
+from .selection import PathwaySelect
 
 from itertools import chain
 import re

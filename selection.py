@@ -8,7 +8,8 @@ in downstream prediction algorithms.
 
 # Author: Michal Grzadkowski <grzadkow@ohsu.edu>
 
-from data import get_pc2_neighb
+from .data import get_pc2_neighb
+
 from itertools import chain
 import re
 import dill as pickle

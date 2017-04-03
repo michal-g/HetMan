@@ -6,10 +6,9 @@ import pickle
 import sys
 import synapseclient
 
-sys.path += ['/home/users/grzadkow/compbio/scripts/HetMan']
-from mutation import *
-from cohorts import Cohort
-import classifiers
+from .mutation import *
+from .cohorts import Cohort
+from . import classifiers
 
 from itertools import combinations as combn
 from itertools import chain, product
@@ -67,6 +66,20 @@ class TypeTester(object):
             MuType({('Gene', 'TTN'): {('Gene', 'TTN2'): None}}),
             ),
 
+        'synonym': (
+            MuType({('Gene', ('TTN', 'TP53')):None}),
+            MuType({('Gene', 'TTN'): None, ('Gene', 'TP53'): None}),
+            MuType({('Gene', 'TTN'):
+                    {('Form', ('Silent', 'Splice')):
+                     {('Protein', ('p43T', 'p55H')): None}}}),
+            MuType({('Gene', 'TTN'): {('Form', 'Silent'):
+                                      {('Protein', 'p43T'): None},
+                                      ('Form', ('Splice', 'Silent')):
+                                      {('Protein', 'p55H'): None},
+                                      ('Form', 'Splice'):
+                                      {('Protein', 'p43T'): None}}}),
+            ),
+
         'TP53': (
             MuType({('Form', 'Splice_Site'):None}),
             MuType({('Exon', ('7/11', '8/11')):None}),
@@ -97,7 +110,12 @@ class TypeTester(object):
         print(request)
 
     def get_types(self):
-        return self.mtypes[self.type_lbl]
+        if self.type_lbl in self.mtypes:
+            return self.mtypes[self.type_lbl]
+        elif self.type_lbl == '_all':
+            return reduce(lambda x,y: x+y, self.mtypes.values())
+        else:
+            raise KeyError("Unknown MuType test set!")
 
 
 @pytest.fixture(scope='module')
@@ -212,7 +230,7 @@ class TestCaseBasicMuTree:
             assert mtree.allkey(lvl_set) == lvl_key
 
 
-@pytest.mark.parametrize('type_tester', ['small', 'blank', 'TP53'],
+@pytest.mark.parametrize('type_tester', ['small', 'TP53', 'binary'],
                          indirect=True, scope="class")
 class TestCaseBasicMuType:
     """Tests for basic functionality of MuTypes."""
@@ -251,7 +269,7 @@ class TestCaseBasicMuType:
 class TestCaseMuTypeBinary:
     """Tests the binary operators defined for MuTypes."""
 
-    @pytest.mark.parametrize('type_tester', ['small', 'blank', 'TP53'],
+    @pytest.mark.parametrize('type_tester', ['_all'],
                              indirect=True, scope="function")
     def test_invariants(self, type_tester):
         """Do binary operators preserve set theoretic invariants?"""
@@ -260,15 +278,18 @@ class TestCaseMuTypeBinary:
         for mtype in mtypes:
             assert mtype == (mtype & mtype)
             assert mtype == (mtype | mtype)
+            assert (mtype - mtype) is None
 
         for mtype1, mtype2 in combn(mtypes, 2):
-            assert (mtype1 | mtype2) >= (mtype1 & mtype2)
+            assert not (mtype1 | mtype2) < (mtype1 & mtype2)
             if mtype1 >= mtype2:
-                print(mtype1)
-                print(mtype2)
-                assert (mtype1 & mtype2) == mtype2
-            elif mtype1 <= mtype2:
-                assert (mtype1 | mtype2) == mtype2
+                if mtype2 != (mtype1 & mtype2):
+                    print(mtype1)
+                    print(mtype2)
+                    print(mtype1 & mtype2)
+                assert mtype2 == (mtype1 & mtype2)
+            if mtype1 <= mtype2:
+                assert mtype2 == (mtype1 | mtype2)
 
     @pytest.mark.parametrize('type_tester', ['small'],
                              indirect=True, scope="function")
@@ -310,6 +331,16 @@ class TestCaseMuTypeBinary:
                      {('Form', 'Missense_Mutation'):
                       {('Exon', '10/363'): None}}})
                     )
+
+    @pytest.mark.parametrize('type_tester', ['binary'],
+                             indirect=True, scope="function")
+    def test_sub(self, type_tester):
+        """Can we subtract one MuType from another?"""
+        mtypes = type_tester.get_types()
+
+        assert ((mtypes[2] - mtypes[0])
+                == MuType({('Gene', 'TP53'):
+                           {('Form', 'Missense_Mutation'): None}}))
 
 
 class TestCaseMuTypeSamples:
@@ -412,6 +443,26 @@ class TestCaseMuTreeLevels:
         for (gene, form), mut in muts.groupby(['Gene', 'Form']):
             mtype = MuType({('Gene', gene):{('Form', form):None}})
             assert mtype.get_samples(mtree) == set(mut['Sample'])
+
+
+class TestCaseAdvancedMuTree:
+    """Tests for advanced functionality of MuTypes."""
+
+    @pytest.mark.parametrize('type_tester', ['synonym'],
+                             indirect=True, scope="function")
+    def test_synonyms(self, type_tester):
+        """Are MuTypes with synonymous mutation keys identical?"""
+        mtypes = type_tester.get_types()
+
+        assert mtypes[0] == mtypes[1]
+        assert mtypes[2] == mtypes[3]
+
+    @pytest.mark.parametrize('type_tester', ['TP53'],
+                             indirect=True, scope="function")
+    def test_prune(self, type_tester):
+        """Can the branches of MuTypes be correctly pruned?"""
+        pass
+
 
 class TestCaseCohort:
     """Tests cohort functionality."""

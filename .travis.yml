@@ -11,6 +11,7 @@ install:
         - conda update -q conda
         - conda update conda-env
         - conda install nbformat
+        - pip install .
         - conda info -a
         - conda env create
         - source activate HetMan

@@ -7,7 +7,7 @@ This file contains classes for representing and storing mutation sub-types.
 
 # Author: Michal Grzadkowski <grzadkow@ohsu.edu>
 
-from pipelines import ClassPipe, RegrPipe
+from .pipelines import ClassPipe, RegrPipe
 
 import pandas as pd
 
@@ -153,8 +153,12 @@ class MuTree(object):
     # .. functions for custom parsing of mutation levels ..
     @staticmethod
     def parse_base(muts, parse_lvl):
-        new_muts = muts.replace(to_replace={parse_lvl: {'_(Del|Ins)$': ''}},
-                                regex=True, inplace=False)
+        new_muts = muts
+        new_muts[parse_lvl + '_base'] = new_muts[parse_lvl]
+        new_muts = new_muts.replace(
+            to_replace={(parse_lvl + '_base'): {'_(Del|Ins)$': ''}},
+            regex=True, inplace=False)
+
         return new_muts
 
     @staticmethod
@@ -164,8 +168,10 @@ class MuTree(object):
         clust_vec = [(parse_lvl + '_'
                       + str(round(mshift.cluster_centers_[x,0], 2)))
                      for x in mshift.labels_]
-        muts[parse_lvl] = clust_vec
-        return muts
+        new_muts = mut
+        new_muts[parse_lvl + '_clust'] = clust_vec
+
+        return new_muts
 
     @staticmethod
     def parse_scores(muts, parse_lvl):
@@ -753,19 +759,31 @@ class MuType(object):
         # their further subdivisions if they exist
         membs = [(k,) if isinstance(k, str) else k
                  for _,k in list(set_key.keys())]
-        children = dict(
-            tuple((v, ch)) if isinstance(ch, MuType) or ch is None else
-            tuple((v, MuType(ch)))
-            for v,ch in zip(membs, list(set_key.values()))
-            )
+        children = {
+            tuple(i for i in k):
+            (ch if ch is None or isinstance(ch, MuType) else MuType(ch))
+            for k,ch in zip(membs, set_key.values())
+            }
 
-        # merges subsets at this level if their children are the same, i.e.
-        # missense:None, frameshift:None => (missense,frameshift):None
+        # merges subsets at this level if their children are the same:
+        #   missense:None, frameshift:None => (missense,frameshift):None
+        # or if they have the same keys:
+        #   (missense, splice):M1, missense:M2, splice:M2
+        #    => (missense, splice):(M1, M2)
         uniq_ch = set(children.values())
-        self.child = {frozenset(i for j in
-                                [k for k,v in list(children.items())
-                                 if v == ch]
-                                for i in j):ch for ch in uniq_ch}
+        uniq_vals = tuple((frozenset(i for j in
+                              [k for k,v in children.items() if v == ch]
+                              for i in j), ch) for ch in uniq_ch)
+
+        self.child = {}
+        for val, ch in uniq_vals:
+            if val in self.child:
+                if ch is None or self.child[val] is None:
+                    self.child[val] = None
+                else:
+                    self.child[val] |= ch
+            else:
+                self.child[val] = ch
 
     def __iter__(self):
         """Returns an expanded representation of the set structure."""
@@ -792,7 +810,7 @@ class MuType(object):
             new_str += (self.level_ + ' IS '
                         + reduce(lambda x,y: x + ' OR ' + y, k))
             if v is not None:
-                new_str += ' AND ' + '\n\t' + str(v)
+                new_str += '\n\tAND ' + str(v)
             new_str += '\nOR '
         return gsub('\nOR $', '', new_str)
 
@@ -873,8 +891,9 @@ class MuType(object):
                     if self_dict[k] is not None:
                         if other_dict[k] is None:
                             return False
-                        else:
-                            return self_dict[k] >= other_dict[k]
+                        elif not (self_dict[k] >= other_dict[k]):
+                            return False
+                                
             else:
                 return False
         else:
@@ -895,7 +914,8 @@ class MuType(object):
                     if other_dict[k] is None:
                         return False
                     elif self_dict[k] is not None:
-                        return self_dict[k] >= other_dict[k]
+                        if not (self_dict[k] > other_dict[k]):
+                            return False
             else:
                 return False
         else:
@@ -905,25 +925,25 @@ class MuType(object):
 
     def __sub__(self, other):
         """Subtracts one MuType from another."""
-        if self.level_ != other.level_:
-            raise HetmanDataError("mismatching MuType levels")
-        self_keys = reduce(lambda x,y: x|y, list(self.child.keys()))
-        other_keys = reduce(lambda x,y: x|y, list(other.child.keys()))
-        self_keys = {x:reduce(lambda x,y: x|y,
-                                [v for k,v in list(self.child.items()) if x in k])
-                       for x in self_keys}
-        other_keys = {x:reduce(lambda x,y: x|y,
-                                 [v for k,v in list(other.child.items()) if x in k])
-                        for x in other_keys}
+        if not isinstance(other, MuType):
+            return NotImplemented
         new_key = {}
-        for k in self_keys:
-            if k in other_keys:
-                if (other_keys[k] is not None
-                    and self_keys[k] != other_keys[k]):
-                    sub_val = self_keys[k] - other_keys[k]
-                    new_key.update({(self.level_, k):sub_val})
-            else:
-                new_key.update({(self.level_, k):self_keys[k]})
+        self_dict = dict(self)
+        other_dict = dict(other)
+
+        if self.level_ == other.level_:
+            for k in self_dict.keys():
+                if k in other_dict:
+                    if other_dict[k] is not None:
+                        if self_dict[k] is not None:
+                            sub_val = self_dict[k] - other_dict[k]
+                            if sub_val is not None:
+                                new_key.update({(self.level_, k): sub_val})
+                        else:
+                            new_key.update({(self.level_, k): self_dict[k]})
+                else:
+                    new_key.update({(self.level_, k): self_dict[k]})
+
         if new_key:
             return MuType(new_key)
         else:
@@ -1010,6 +1030,7 @@ class MuType(object):
         """
         new_key = {}
         self_ch = self.raw_key()
+
         for k in (set(mtree.child.keys()) - set(self_ch.keys())):
             new_key[(self.level_, k)] = None
         for k in (set(mtree.child.keys()) & set(self_ch.keys())):

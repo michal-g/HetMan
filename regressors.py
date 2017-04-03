@@ -10,8 +10,8 @@ This file contains the algorithms used to predict continuous mutation states.
 from math import exp
 from scipy import stats
 
-from pipelines import RegrPipe
-from selection import PathwaySelect
+from .pipelines import RegrPipe
+from .selection import PathwaySelect
 
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import ElasticNet as ENet
