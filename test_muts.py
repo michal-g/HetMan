@@ -1,19 +1,23 @@
 
+"""
+HetMan (Heterogeneity Manifold)
+Classification of mutation sub-types using expression data.
+This file contains tests for mutation sub-type representations.
+"""
+
+# Author: Michal Grzadkowski <grzadkow@ohsu.edu>
+
+from .mutation import MuType, MuTree
+
 import pytest
-import numpy as np
-import pandas as pd
 import pickle
-import sys
-import synapseclient
 
-from .mutation import *
-from .cohorts import Cohort
-from . import classifiers
-
+from functools import reduce
 from itertools import combinations as combn
 from itertools import chain, product
 
 
+# .. objects that are re-used across many different tests ..
 @pytest.fixture(scope='module')
 def muts_tester(request):
     """Create a mutation table."""
@@ -107,7 +111,6 @@ class TypeTester(object):
 
     def __init__(self, request):
         self.type_lbl = request
-        print(request)
 
     def get_types(self):
         if self.type_lbl in self.mtypes:
@@ -116,14 +119,6 @@ class TypeTester(object):
             return reduce(lambda x,y: x+y, self.mtypes.values())
         else:
             raise KeyError("Unknown MuType test set!")
-
-
-@pytest.fixture(scope='module')
-def cdata_small():
-    syn = synapseclient.Synapse()
-    syn.login('grzadkow', 'W0w6g1i8A')
-    return Cohort(syn, cohort='COAD', mut_genes=['BRAF','TP53','PIK3CA'],
-                  mut_levels=('Gene', 'Form', 'Protein'))
 
 
 @pytest.mark.parametrize('muts_tester',
@@ -283,10 +278,6 @@ class TestCaseMuTypeBinary:
         for mtype1, mtype2 in combn(mtypes, 2):
             assert not (mtype1 | mtype2) < (mtype1 & mtype2)
             if mtype1 >= mtype2:
-                if mtype2 != (mtype1 & mtype2):
-                    print(mtype1)
-                    print(mtype2)
-                    print(mtype1 & mtype2)
                 assert mtype2 == (mtype1 & mtype2)
             if mtype1 <= mtype2:
                 assert mtype2 == (mtype1 | mtype2)
@@ -433,7 +424,7 @@ class TestCaseMuTreeLevels:
     @pytest.mark.parametrize(
         'muts_tester',
         [('test/muts_large.p',
-          ('Gene', 'Form_base', 'Form', 'Protein', 'Protein_base'))],
+          ('Gene', 'Form_base', 'Form'))],
         ids=muts_id, indirect=True, scope="function")
     def test_base_parse(self, muts_tester):
         """Is the _base mutation level parser correctly defined?"""
@@ -462,22 +453,5 @@ class TestCaseAdvancedMuTree:
     def test_prune(self, type_tester):
         """Can the branches of MuTypes be correctly pruned?"""
         pass
-
-
-class TestCaseCohort:
-    """Tests cohort functionality."""
-
-    def test_clf(self, cdata_small):
-        """Can we use a classifier on a Cohort?"""
-        mtype = MuType({('Gene', 'BRAF'):{('Protein', 'p.V600E'): None}})
-        clf = classifiers.Lasso()
-        old_C = clf.named_steps['fit'].C
-
-        cdata_small.tune_clf(clf, mtype=mtype)
-        assert clf.named_steps['fit'].C != old_C
-        cdata_small.score_clf(clf, mtype=mtype)
-        cdata_small.fit_clf(clf, mtype=mtype)
-        cdata_small.predict_clf(clf, use_test=False)
-        cdata_small.eval_clf(clf, mtype=mtype)
 
 

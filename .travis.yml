@@ -16,5 +16,5 @@ install:
         - conda env create
         - source activate HetMan
 
-script: pytest -vv test_hetman.py
+script: pytest -vv test_muts.py
 

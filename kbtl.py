@@ -11,11 +11,13 @@ detail in http://www.aaai.org/ocs/index.php/AAAI/AAAI14/paper/view/8132.
 
 # Author: Michal Grzadkowski <grzadkow@ohsu.edu>
 
-from classif import PathwaySelect
+from .pipelines import MultiPipe
+from .selection import PathwaySelect
+
+import numpy as np
 
 from random import gauss as rnorm
 from math import log, exp
-import numpy as np
 from scipy import stats
 
 import collections
