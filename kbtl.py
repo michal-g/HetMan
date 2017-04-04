@@ -175,29 +175,20 @@ class KBTL(object):
         y_list = [[1.0 if x else -1.0 for x in y] for y in y_list]
 
         # initializes matrix of priors for task-specific projection matrices
-        lambdas = [{'alpha': np.matrix([[self.lambda_par['a'] + 0.5
-                                         for i in range(self.R)]
-                                        for j in range(d_count)]),
-                    'beta': np.matrix([[self.lambda_par['b']
-                                        for i in range(self.R)]
-                                       for j in range(d_count)])}
-                   for d_count in data_count]
+        lambdas = [{'alpha': np.matrix(np.zeros(shape=(d_count, selfR))) + selflambda_par['a'] + 0.5,
+                    'beta': np.matrix(np.zeros(shape=(d_count, selfR))) + selflambda_par['b']
+                    } for d_count in data_count]
 
         # initializes task-specific projection matrices
-        A_list = [{'mu': np.matrix([[rnorm(0,1)
-                                     for i in range(self.R)]
-                                    for j in range(d_count)]),
-                   'sigma': np.array([np.diag([1.0 for i in range(d_count)])
-                                      for r in range(self.R)])}
-                  for d_count in data_count]
+        A_list = [{'mu': np.matrix(np.random.normal(0, 1, (selfR * d_count)).reshape(d_count, selfR)),
+                   'sigma': (np.eye(d_count)[..., None] * ([1] * R)).T
+                   } for d_count in data_count]
 
         # initializes task-specific representations in shared sub-space
-        H_list = [{'mu': np.matrix([[rnorm(0,1)
-                                     for i in range(d_count)]
-                                    for j in range(self.R)]),
-                   'sigma': np.matrix(
-                       np.diag([1.0 for i in range(self.R)]))}
-                  for d_count in data_count]
+        H_list = [{'mu': np.matrix(np.random.normal(0, 1, (selfR * d_count)).reshape(selfR, d_count)),
+                   # same as A_list but R and d flipped
+                   'sigma': np.matrix(np.eye(R)[..., None])
+                   } for d_count in data_count]
 
         # initializes hyper-parameters
         gamma_alpha = self.gamma_par['a'] + 0.5
