@@ -1,6 +1,6 @@
 
 """
-Hetman (Heterogeneity Manifold)
+HetMan (Heterogeneity Manifold)
 Prediction of mutation sub-types using expression data.
 This file contains the methods used to select genetic features for use
 in downstream prediction algorithms.

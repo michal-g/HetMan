@@ -1,6 +1,6 @@
 
 """
-Hetman (Heterogeneity Manifold)
+HetMan (Heterogeneity Manifold)
 Classification of mutation sub-types using expression data.
 This file contains classes that consolidate -omics datasets for use in
 testing classifiers.

@@ -7,7 +7,10 @@ This file contains tests for mutation sub-type representations.
 
 # Author: Michal Grzadkowski <grzadkow@ohsu.edu>
 
-from .mutation import MuType, MuTree
+from .mutation import MuType, MuTree, HetManMutError
+
+import numpy as np
+import pandas as pd
 
 import pytest
 import pickle
@@ -276,11 +279,16 @@ class TestCaseMuTypeBinary:
             assert (mtype - mtype) is None
 
         for mtype1, mtype2 in combn(mtypes, 2):
-            assert not (mtype1 | mtype2) < (mtype1 & mtype2)
-            if mtype1 >= mtype2:
-                assert mtype2 == (mtype1 & mtype2)
-            if mtype1 <= mtype2:
-                assert mtype2 == (mtype1 | mtype2)
+            if mtype1.get_levels() == mtype2.get_levels():
+                assert not (mtype1 | mtype2) < (mtype1 & mtype2)
+
+            if mtype1.get_levels() <= mtype2.get_levels():
+                if mtype1 >= mtype2:
+                    assert mtype2 == (mtype1 & mtype2)
+
+            if mtype1.get_levels() >= mtype2.get_levels():
+                if mtype1 <= mtype2:
+                    assert mtype2 == (mtype1 | mtype2)
 
     @pytest.mark.parametrize('type_tester', ['small'],
                              indirect=True, scope="function")
@@ -395,6 +403,49 @@ class TestCaseMuTypeSamples:
         assert (mtypes[2].get_samples(mtree)
                 == set(muts['Sample'][(muts['Protein'] == 'p.R158L')
                                       | (muts['Protein'] == '.')]))
+
+    @pytest.mark.parametrize(
+        ('muts_tester', 'type_tester'),
+        [(('test/muts_TP53.p', ('Gene', 'Form', 'Exon', 'Protein')), 'TP53')],
+        ids=muts_id, indirect=True, scope="function")
+    def test_status(self, muts_tester, type_tester):
+        """Can we get a vector of mutation status from a MuTree?"""
+        muts, mtree, mut_lvls = muts_tester.get_muts_mtree()
+        mtypes = type_tester.get_types()
+
+        for mtype in mtypes:
+            assert (mtree.status(['herpderp', 'derpherp'], mtype)
+                    == [False, False])
+
+        assert (
+            mtree.status(['TCGA-04-1357-01A', 'dummy1', 'dummy2'],
+                         MuType({('Protein', ('p.E224Gfs*4', 'nah')): None}))
+            == [True, False, False]
+            )
+
+        samp_list = pd.Series(np.unique(muts['Sample']))
+        assert (mtree.status(samp_list, mtypes[0])
+                == samp_list.isin(
+                    muts['Sample'][muts['Form'] == 'Splice_Site'])).all()
+        assert (mtree.status(samp_list, mtypes[1])
+                == samp_list.isin(
+                    muts['Sample'][(muts['Exon'] == '7/11')
+                                   | (muts['Exon'] == '8/11')])).all()
+        assert (mtree.status(samp_list, mtypes[2])
+                == samp_list.isin(
+                    muts['Sample'][(muts['Protein'] == 'p.R158L')
+                                   | (muts['Protein'] == '.')])).all()
+
+    @pytest.mark.parametrize(
+        'muts_tester',
+        [('test/muts_TP53.p', ('Gene', 'Form', 'PolyPhen_scores'))],
+        ids=muts_id, indirect=True, scope="function")
+    def test_scores(self, muts_tester):
+        """Can we get a vector of mutation scores from a MuTree?"""
+        muts, mtree, mut_lvls = muts_tester.get_muts_mtree()
+
+        assert mtree.status(['herpderp', 'derpherp'],
+                    ) == [0, 0]
 
 
 class TestCaseMuTreeLevels:

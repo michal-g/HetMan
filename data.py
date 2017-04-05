@@ -1,6 +1,6 @@
 
 """
-Hetman (Heterogeneity Manifold)
+HetMan (Heterogeneity Manifold)
 Classification of mutation sub-types using expression data.
 This file contains functions for loading and processing -omic data downloaded
 from sources such as TCGA, ICGC, and Firehose.
