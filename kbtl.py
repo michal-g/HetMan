@@ -175,35 +175,34 @@ class KBTL(object):
         y_list = [[1.0 if x else -1.0 for x in y] for y in y_list]
 
         # initializes matrix of priors for task-specific projection matrices
-        lambdas = [{'alpha': np.matrix(np.zeros(shape=(d_count, selfR))) + selflambda_par['a'] + 0.5,
-                    'beta': np.matrix(np.zeros(shape=(d_count, selfR))) + selflambda_par['b']
+        lambdas = [{'alpha': np.matrix(np.zeros(shape=(d_count, self.R))) + self.lambda_par['a'] + 0.5,
+                    'beta': np.matrix(np.zeros(shape=(d_count, self.R))) + self.lambda_par['b']
                     } for d_count in data_count]
 
         # initializes task-specific projection matrices
-        A_list = [{'mu': np.matrix(np.random.normal(0, 1, (selfR * d_count)).reshape(d_count, selfR)),
-                   'sigma': (np.eye(d_count)[..., None] * ([1] * R)).T
+        A_list = [{'mu': np.matrix(np.random.normal(0, 1, (self.R * d_count)).reshape(d_count, self.R)),
+                   'sigma': (np.eye(d_count)[..., None] * ([1] * self.R)).T
                    } for d_count in data_count]
 
         # initializes task-specific representations in shared sub-space
-        H_list = [{'mu': np.matrix(np.random.normal(0, 1, (selfR * d_count)).reshape(selfR, d_count)),
+        H_list = [{'mu': np.matrix(np.random.normal(0, 1, (self.R * d_count)).reshape(self.R, d_count)),
                    # same as A_list but R and d flipped
-                   'sigma': np.matrix(np.eye(R)[..., None])
+                   'sigma': np.matrix(np.eye(self.R)[..., None])
                    } for d_count in data_count]
 
         # initializes hyper-parameters
         gamma_alpha = self.gamma_par['a'] + 0.5
         gamma_beta = self.gamma_par['b']
-        eta_alpha = [self.eta_par['a'] + 0.5 for i in range(self.R)]
-        eta_beta = [self.eta_par['b'] for i in range(self.R)]
-        bw_mu = [0]
-        bw_mu.extend([rnorm(0,1) for i in range(self.R)])
-        bw_sigma = np.matrix(np.diag([1 for i in range(self.R+1)]))
+        eta_alpha = (np.repeat(self.eta_par['a'] + 0.5, self.R).tolist())
+        eta_beta = (np.repeat(self.eta_par['b'], self.R).tolist())
+        bw_mu = np.random.normal(0, 1, self.R).tolist()
+        bw_sigma = np.matrix(np.eye(self.R+1), dtype=int)
 
         # initializes predicted outputs
-        f_list = [{'mu': [(abs(rnorm(0,1)) + self.margin)
-                          * np.sign(lbl[i]) for i in range(d_count)],
+        f_list = [{'mu': [(abs(np.random.normal(0, 1)) + self.margin)
+                  * np.sign(lbl[i]) for i in range(d_count)],
                    'sigma': [1 for i in range(d_count)]}
-                  for d_count,lbl in zip(data_count, y_list)]
+                    for d_count, lbl in zip(data_count, y_list)]
 
         # precomputes kernel crossproducts, initializes lower-upper matrix
         kkt_list = [np.dot(x,x.transpose()) for x in kernel_list]
