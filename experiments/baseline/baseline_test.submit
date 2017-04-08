@@ -1,14 +1,15 @@
 # 
-# htCondor submit file for upstream mutex classification analysis
+# htCondor submit file for baseline PRECEPTS classification testing
 #
 # Usage:
-# condor_submit scripts/HetMan/experiments/baseline_test.submit -append 'arguments=BRCA $(Process)'
+# condor_submit scripts/HetMan/experiments/baseline_test.submit -append 'arguments=$(Process)'
+
 
 common_dir = /home/users/grzadkow/compbio
 getenv = True
 
 #Program
-executable = $(common_dir)/scripts/HetMan/experiments/baseline_test.sh
+executable = $(common_dir)/scripts/HetMan/experiments/baseline/baseline_test.sh
 
 #stdout
 output=$(common_dir)/condor/HetMan/out-logs/base_$(Process).log

@@ -34,12 +34,16 @@ def muts_id(val):
         return val
 
 class MutsTester(object):
+
+    # where test mutation datasets are expected to be located
+    mut_file_base = 'example_muts/muts_'
+
     def __init__(self, request):
-        self.muts_file = request[0]
+        self.muts_lbl = request[0]
         self.mut_levels = request[1]
 
-    def get_muts_mtree(self, levels=None):
-        with open(self.muts_file, 'rb') as fl:
+    def get_muts_mtree(self):
+        with open(self.mut_file_base + self.muts_lbl + '.p', 'rb') as fl:
             muts = pickle.load(fl)
         mtree = MuTree(muts, levels=self.mut_levels)
         return muts, mtree, self.mut_levels
@@ -125,8 +129,8 @@ class TypeTester(object):
 
 
 @pytest.mark.parametrize('muts_tester',
-                         [('test/muts_small.p', ('Gene', 'Form', 'Exon')),
-                          ('test/muts_TP53.p', ('Form', 'Exon', 'Protein'))],
+                         [('small', ('Gene', 'Form', 'Exon')),
+                          ('TP53', ('Form', 'Exon', 'Protein'))],
                          ids=muts_id, indirect=True, scope="class")
 class TestCaseBasicMuTree:
     """Tests for basic functionality of MuTrees."""
@@ -347,11 +351,11 @@ class TestCaseMuTypeSamples:
 
     @pytest.mark.parametrize(
         ('muts_tester', 'type_tester'),
-        [(('test/muts_small.p', ('Gene', 'Form', 'Exon')), 'small'),
-         (('test/muts_large.p', ('Gene', 'Form', 'Exon')), 'small'),
-         (('test/muts_large.p', ('Gene', 'Type', 'Form', 'Exon', 'Protein')),
+        [(('small', ('Gene', 'Form', 'Exon')), 'small'),
+         (('large', ('Gene', 'Form', 'Exon')), 'small'),
+         (('large', ('Gene', 'Type', 'Form', 'Exon', 'Protein')),
           'small'),
-         (('test/muts_TP53.p', ('Gene', 'Form', 'Exon')), 'small')],
+         (('TP53', ('Gene', 'Form', 'Exon')), 'small')],
         ids=muts_id, indirect=True, scope="function")
     def test_basic(self, muts_tester, type_tester):
         """Can we use basic MuTypes to get samples in MuTrees?"""
@@ -372,9 +376,9 @@ class TestCaseMuTypeSamples:
 
     @pytest.mark.parametrize(
         ('muts_tester', 'type_tester'),
-        [(('test/muts_small.p', ('Gene', 'Form', 'Exon')), 'blank'),
-         (('test/muts_large.p', ('Gene', 'Form', 'Exon')), 'blank'),
-         (('test/muts_large.p', ('Gene', 'Protein', 'Exon')), 'blank')],
+        [(('small', ('Gene', 'Form', 'Exon')), 'blank'),
+         (('large', ('Gene', 'Form', 'Exon')), 'blank'),
+         (('large', ('Gene', 'Protein', 'Exon')), 'blank')],
         ids=muts_id, indirect=True, scope="function")
     def test_blank(self, muts_tester, type_tester):
         """Are cases where no samples present properly handled?"""
@@ -388,7 +392,7 @@ class TestCaseMuTypeSamples:
 
     @pytest.mark.parametrize(
         ('muts_tester', 'type_tester'),
-        [(('test/muts_TP53.p', ('Gene', 'Form', 'Exon', 'Protein')), 'TP53')],
+        [(('TP53', ('Gene', 'Form', 'Exon', 'Protein')), 'TP53')],
         ids=muts_id, indirect=True, scope="function")
     def test_TP53(self, muts_tester, type_tester):
         """Can subsets of TP53 be correctly retrieved?"""
@@ -406,7 +410,7 @@ class TestCaseMuTypeSamples:
 
     @pytest.mark.parametrize(
         ('muts_tester', 'type_tester'),
-        [(('test/muts_TP53.p', ('Gene', 'Form', 'Exon', 'Protein')), 'TP53')],
+        [(('TP53', ('Gene', 'Form', 'Exon', 'Protein')), 'TP53')],
         ids=muts_id, indirect=True, scope="function")
     def test_status(self, muts_tester, type_tester):
         """Can we get a vector of mutation status from a MuTree?"""
@@ -438,7 +442,7 @@ class TestCaseMuTypeSamples:
 
     @pytest.mark.parametrize(
         'muts_tester',
-        [('test/muts_TP53.p', ('Gene', 'Form', 'PolyPhen_scores'))],
+        [('TP53', ('Gene', 'Form', 'PolyPhen_scores'))],
         ids=muts_id, indirect=True, scope="function")
     def test_scores(self, muts_tester):
         """Can we get a vector of mutation scores from a MuTree?"""
@@ -452,7 +456,7 @@ class TestCaseMuTreeLevels:
     """Tests for custom mutation levels."""
 
     @pytest.mark.parametrize('muts_tester',
-                             [('test/muts_large.p',
+                             [('large',
                                ('Gene', 'Type', 'Form', 'Protein'))],
                              ids=muts_id, indirect=True, scope="function")
     def test_type(self, muts_tester):
@@ -474,7 +478,7 @@ class TestCaseMuTreeLevels:
 
     @pytest.mark.parametrize(
         'muts_tester',
-        [('test/muts_large.p',
+        [('large',
           ('Gene', 'Form_base', 'Form'))],
         ids=muts_id, indirect=True, scope="function")
     def test_base_parse(self, muts_tester):

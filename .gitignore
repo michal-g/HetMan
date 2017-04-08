@@ -3,4 +3,7 @@
 *.R
 *cache*
 *scratch*
+*rc
+experiments/*/output
+experiments/*/plots
 

@@ -1,8 +1,13 @@
 
+"""
+Creates plots for baseline testing.
+"""
+
 import numpy as np
 import pandas as pd
 
 import pickle
+import re
 from os import listdir
 from os.path import isfile, join
 from math import log
@@ -12,9 +17,7 @@ from matplotlib.colors import ListedColormap
 import matplotlib.patches as mpatches
 
 
-base_dir = '/home/users/grzadkow/compbio/scripts/HetMan/experiments/'
-in_dir = base_dir + 'output/'
-out_dir = base_dir + 'output/plots/'
+base_dir = '/home/users/grzadkow/compbio/scripts/HetMan/experiments/baseline'
 
 marker_map = {'All': "*",
               'Neigh': "s",
@@ -23,9 +26,10 @@ marker_map = {'All': "*",
               'Up': '<'}
 
 
-def load_files(path, pattern):
-    file_list = [f for f in listdir(path)
-                 if isfile(join(path, f)) and pattern in f]
+def load_output():
+    file_list = [f for f in listdir(base_dir + '/output/')
+                 if isfile(join(path, f))
+                 and re.search(pattern + '.*\\.p$', f)]
     return [pickle.load(open(path + "/" + fl, 'rb')) for fl in file_list]
 
 

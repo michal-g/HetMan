@@ -125,7 +125,8 @@ class MutPipe(Pipeline):
 
     def get_coef(self):
         """Gets the coefficients of the classifier."""
-        return self.named_steps['fit'].coefs_
+        return dict(zip(self.named_steps['feat'].expr_genes,
+                        self.named_steps['fit'].coef_[0]))
 
 
 class ClassPipe(MutPipe):
