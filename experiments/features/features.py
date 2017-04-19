@@ -1,12 +1,4 @@
 
-"""
-HetMan (Heterogeneity Manifold)
-Classification of mutation sub-types using expression data.
-This file contains a series of baseline tests of classifier performance.
-"""
-
-# Author: Michal Grzadkowski <grzadkow@ohsu.edu>
-
 import sys
 sys.path += ['/home/users/grzadkow/compbio/scripts']
 
@@ -18,13 +10,23 @@ import pickle
 import time
 import synapseclient
 
+# list of possible feature selection methods based on neighbourhoods
+# in the Pathway Commons graph
+key_list = {
+    'Up': ((['Up'], ()), ),
+    'Neigh': ((['Up', 'Down'], ()), ),
+    'expr': (((), ['controls-expression-of']), ),
+    'Down': ((['Down'], ()), )
+    }
+
 
 def main(argv):
-    """Runs the experiment."""
+    """Run the experiment."""
     syn = synapseclient.Synapse()
     syn.login('grzadkow', 'W0w6g1i8A')
 
-    # which mutations we want to consider in our test
+    # define which mutation and feature selection method
+    # we want to use in the experiment
     mtypes = (
         ('BRCA', MuType({('Gene', 'TP53'):
                          {('Form', 'Missense_Mutation'): None}})),
@@ -32,13 +34,6 @@ def main(argv):
                          {('Protein', 'p.H1047R'): None}})),
         ('BRCA', MuType({('Gene', 'CDH1'):
                          {('Form', ('Frame_Shift_Ins', 'Frame_Shift_Del')):
-                          None}})),
-        ('SKCM', MuType({('Gene', 'BRAF'):
-                         {('Protein', 'p.V600E'): None}})),
-        ('COAD', MuType({('Gene', 'TTN'):
-                         {('Form', 'Intron'): None}})),
-        ('UCEC', MuType({('Gene', 'PTEN'):
-                         {('Form', ('Frame_Shift_Del', 'Nonsense_Mutation')):
                           None}})),
         )
 
@@ -59,30 +54,34 @@ def main(argv):
             mut_levels=['Gene', 'Form', 'Protein'],
             cv_info={'Prop':2/3.0, 'Seed':int(argv[-1])+1})
 
-
         for clf in clf_list:
             clf_lbl = clf.__name__
 
             for mut_gene, mtype in zip(coh_genes, coh_mtypes):
                 mut_lbl = coh + '_' + mut_gene
 
-                # tune the hyper-parameters of the classifier using the
-                # training samples
-                clf_obj = clf(path_keys=None)
-                start_time = time.time()
-                cdata.tune_clf(clf_obj, mtype=mtype,
-                               tune_splits=4, test_count=32)
-                print(clf_obj)
+                for key_lbl, fs_key in key_list.items():
+                    run_lbl = (clf_lbl, mut_lbl, key_lbl)
 
-                # fit the tuned classifier and score using the testing samples
-                cdata.fit_clf(clf_obj, mtype=mtype)
-                scores[(clf_lbl, mut_lbl)] = cdata.eval_clf(
-                    clf_obj, mtype=mtype)
-                times[(clf_lbl, mut_lbl)] = time.time() - start_time
+                    # tune the hyper-parameters of the classifier using the
+                    # training samples
+                    clf_obj = clf(path_keys=fs_key)
+                    start_time = time.time()
+                    cdata.tune_clf(clf_obj, mtype=mtype,
+                                   tune_splits=4, test_count=32)
+                    print(clf_obj)
+
+                    # fit the tuned classifier and score using
+                    # the testing samples
+                    cdata.fit_clf(clf_obj, mtype=mtype)
+                    scores[run_lbl] = cdata.eval_clf(
+                        clf_obj, mtype=mtype)
+                    times[run_lbl] = time.time() - start_time
 
     out_file = ('/home/users/grzadkow/compbio/scripts/HetMan/experiments/'
-                'baseline/output/base__run' + argv[-1] + '.p')
-    out_data = {'AUC': scores, 'time': times, 'mtypes': mtypes}
+                'features/output/base__run' + argv[-1] + '.p')
+    out_data = {'AUC': scores, 'time': times,
+                'mtypes': mtypes, 'features': key_list}
     pickle.dump(out_data, open(out_file, 'wb'))
 
 

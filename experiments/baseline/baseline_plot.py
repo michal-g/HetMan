@@ -18,19 +18,66 @@ import matplotlib.patches as mpatches
 
 
 base_dir = '/home/users/grzadkow/compbio/scripts/HetMan/experiments/baseline'
-
 marker_map = {'All': "*",
               'Neigh': "s",
               'Down': ">",
               'expr': '+',
               'Up': '<'}
+alg_order = ('NaiveBayes', 'Lasso', 'SVCrbf', 'rForest')
 
 
 def load_output():
-    file_list = [f for f in listdir(base_dir + '/output/')
-                 if isfile(join(path, f))
-                 and re.search(pattern + '.*\\.p$', f)]
-    return [pickle.load(open(path + "/" + fl, 'rb')) for fl in file_list]
+    output_dir = base_dir + '/output/'
+    file_list = [fl for fl in listdir(output_dir)
+                 if isfile(join(output_dir, fl))
+                 and re.search('base__run[0-9]+\\.p$', fl)]
+    return [pickle.load(open(join(output_dir, fl), 'rb')) for fl in file_list]
+
+
+def plot_performance():
+    out_data = load_output()
+    mut_genes = np.unique([x[1] for x in out_data[0]['AUC'].keys()])
+    auc_data = [x['AUC'] for x in out_data]
+    auc_min = min([min(x.values()) for x in auc_data]) * 0.9
+    fig, axes = plt.subplots(nrows=2, ncols=3, figsize=(7,11))
+
+    for i, gene in enumerate(mut_genes):
+        perf_data = pd.DataFrame(
+            [{k[0]:v for k,v in x.items() if k[1] == gene}
+             for x in auc_data])
+        alg_indx = [alg_order.index(x) for x in perf_data.columns]
+        perf_data = perf_data.ix[:, alg_indx]
+        gene_lbl = '{1} ({0})'.format(*gene.split('_'))
+
+        axes[i // 3, i % 3].set_title(gene_lbl, fontsize=15)
+        axes[i // 3, i % 3].boxplot(
+            x=np.array(perf_data),
+            boxprops={'linewidth': 1.5},
+            medianprops={'linewidth': 3, 'color': '#960c20'},
+            flierprops={'markersize': 2}
+            )
+
+        if (i // 3) == 1:
+            axes[i // 3, i % 3].set_xticklabels(
+                perf_data.columns,
+                fontsize=12, rotation=45, ha='right')
+        else:
+            axes[i // 3, i % 3].set_xticklabels(
+                np.repeat('', len(alg_indx)))
+
+        if (i % 3) == 0:
+            axes[i // 3, i % 3].set_ylabel('AUC', fontsize=19)
+        else:
+            axes[i // 3, i % 3].set_yticklabels([])
+
+        axes[i // 3, i % 3].set_title(gene_lbl, fontsize=16)
+        axes[i // 3, i % 3].plot(
+            list(range(len(alg_indx)+2)), np.repeat(0.5, len(alg_indx)+2),
+            c="black", lw=0.8, ls='--', alpha=0.8)
+        axes[i // 3, i % 3].set_ylim(auc_min, 1.0)
+
+    plt.tight_layout(w_pad=-1.2, h_pad=1.5)
+    plt.savefig(base_dir + '/plots/performance.png', dpi=700)
 
 
 def plot_base(label):

@@ -9,16 +9,16 @@ common_dir = /home/users/grzadkow/compbio
 getenv = True
 
 #Program
-executable = $(common_dir)/scripts/HetMan/experiments/baseline/baseline_test.sh
+executable = $(common_dir)/scripts/HetMan/experiments/features/features.sh
 
 #stdout
-output=$(common_dir)/condor/HetMan/out-logs/base_$(Process).log
+output=$(common_dir)/condor/HetMan/out-logs/features_$(Process).log
 
 #stderr
-error=$(common_dir)/condor/HetMan/err-logs/base_$(Process).log
+error=$(common_dir)/condor/HetMan/err-logs/features_$(Process).log
 
 #Condor log file
-log=$(common_dir)/condor/HetMan/sum-logs/base_$(Process).log
+log=$(common_dir)/condor/HetMan/sum-logs/features_$(Process).log
 
 # #processor cores requested
 request_cpus = 16
