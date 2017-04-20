@@ -26,7 +26,7 @@ from sklearn.metrics.pairwise import (
 
 from sklearn.preprocessing import StandardScaler
 from sklearn.naive_bayes import GaussianNB
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LogisticRegression, SGDClassifier
 from sklearn.svm import SVC
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.neighbors import KNeighborsClassifier
@@ -75,7 +75,7 @@ class LogReg(ClassPipe):
 
     tune_priors = (
         ('fit__alpha', stats.lognorm(scale=exp(1), s=exp(1))),
-        ('fit__l1_ratio', (0.05,0.25,0.5,0.75,1.0))
+        ('fit__l1_ratio', (0.05,0.25,0.5,0.75,0.95))
     )
 
     def __init__(self, path_keys=None):
@@ -153,16 +153,19 @@ class KNeigh(ClassPipe):
     """A class corresponding to k-nearest neighbours voting classification
        of mutation status.
     """
+    
+    tune_priors = (
+        ('fit__n_neighbors', (4,8,16,25,40)),
+    )
 
-    def __init__(self, mut_genes=None, expr_genes=None):
-        self._tune_priors = {
-            'fit__n_neighbors':[40,80,120,160,200,240,300],
-            'fit__leaf_size':[5,10,15,20,30,50]}
+    def __init__(self, path_keys=None):
+        feat_step = PathwaySelect(path_keys=path_keys)
         norm_step = StandardScaler()
         fit_step = KNeighborsClassifier(
             weights='distance', algorithm='ball_tree')
         ClassPipe.__init__(self,
-            [('norm', norm_step), ('fit', fit_step)])
+            [('feat', feat_step), ('norm', norm_step), ('fit', fit_step)],
+            path_keys)
 
 
 class GBCrbf(ClassPipe):

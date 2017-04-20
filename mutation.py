@@ -840,21 +840,39 @@ class MuType(object):
             eq = False
         else:
             eq = (self.child == other.child)
+
         return eq
 
-    def __str__(self):
-        """Printing a MuType shows the hierarchy of mutation
-           properties contained within it."""
+    def __repr__(self):
+        """Shows the hierarchy of mutation properties contained
+           within the MuType."""
         new_str = ''
-        if self.cur_level == 'Gene':
-            new_str += 'a mutation where '
-        for k,v in list(self.child.items()):
-            new_str += (self.cur_level + ' IS '
-                        + reduce(lambda x,y: x + ' OR ' + y, k))
+
+        for k,v in self:
+            if isinstance(k, str):
+                new_str += self.cur_level + ' IS ' + k
+            else:
+                new_str += (self.cur_level + ' IS '
+                            + reduce(lambda x,y: x + ' OR ' + y, k))
+
             if v is not None:
-                new_str += '\n\tAND ' + str(v)
-            new_str += '\nOR '
-        return gsub('\nOR $', '', new_str)
+                new_str += ' AND ' + repr(v)
+            new_str += ' OR '
+
+        return gsub(' OR $', '', new_str)
+
+    def __str__(self):
+        """Gets a condensed label for the MuType."""
+        new_str = ''
+
+        for k,v in self:
+            if v is None:
+                new_str = new_str + k
+            else:
+                new_str = new_str + k + '-' + str(v)
+            new_str = new_str + ', '
+
+        return gsub(', $', '', new_str)
 
     def raw_key(self):
         "Returns the expanded key of a MuType."
@@ -888,7 +906,8 @@ class MuType(object):
         else:
             raise HetManMutError("Cannot take the union of two MuTypes with "
                                  "mismatching mutation levels "
-                                 + self.cur_level + " and " + other.cur_level + "!")
+                                 + self.cur_level + " and "
+                                 + other.cur_level + "!")
 
         return MuType(new_key)
 

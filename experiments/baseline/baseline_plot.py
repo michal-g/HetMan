@@ -3,53 +3,42 @@
 Creates plots for baseline testing.
 """
 
+base_dir = '/home/users/grzadkow/compbio/scripts/HetMan/experiments/baseline'
+from .config import clf_list, mtype_list
+from ..utils import load_output, get_set_plotlbl
+
 import numpy as np
 import pandas as pd
-
-import pickle
-import re
-from os import listdir
-from os.path import isfile, join
-from math import log
+from re import sub as gsub
 
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
 import matplotlib.patches as mpatches
 
 
-base_dir = '/home/users/grzadkow/compbio/scripts/HetMan/experiments/baseline'
-marker_map = {'All': "*",
-              'Neigh': "s",
-              'Down': ">",
-              'expr': '+',
-              'Up': '<'}
-alg_order = ('NaiveBayes', 'Lasso', 'SVCrbf', 'rForest')
+def plot_performance(clf_set='base', mtype_set='default'):
+    out_data = load_output('baseline', clf_set, mtype_set)
+    alg_order = [clf.__name__ for clf in clf_list[clf_set]]
 
-
-def load_output():
-    output_dir = base_dir + '/output/'
-    file_list = [fl for fl in listdir(output_dir)
-                 if isfile(join(output_dir, fl))
-                 and re.search('base__run[0-9]+\\.p$', fl)]
-    return [pickle.load(open(join(output_dir, fl), 'rb')) for fl in file_list]
-
-
-def plot_performance():
-    out_data = load_output()
-    mut_genes = np.unique([x[1] for x in out_data[0]['AUC'].keys()])
     auc_data = [x['AUC'] for x in out_data]
     auc_min = min([min(x.values()) for x in auc_data]) * 0.9
     fig, axes = plt.subplots(nrows=2, ncols=3, figsize=(7,11))
 
-    for i, gene in enumerate(mut_genes):
+    for i, gene in enumerate(mtype_list[mtype_set]):
+
+        # cast performance data into matrix format
         perf_data = pd.DataFrame(
-            [{k[0]:v for k,v in x.items() if k[1] == gene}
+            [{type(k[0]).__name__:v for k,v in x.items() if k[1] == gene}
              for x in auc_data])
         alg_indx = [alg_order.index(x) for x in perf_data.columns]
         perf_data = perf_data.ix[:, alg_indx]
-        gene_lbl = '{1} ({0})'.format(*gene.split('_'))
 
-        axes[i // 3, i % 3].set_title(gene_lbl, fontsize=15)
+        # create and plot the subplot titles describing mutation types
+        gene_lbl = '{}-{}'.format(
+            gene[0], gsub('(-|, )', '\n', str(gene[1])))
+        axes[i // 3, i % 3].set_title(gene_lbl, fontsize=13)
+
+        # plot the boxes showing performances
         axes[i // 3, i % 3].boxplot(
             x=np.array(perf_data),
             boxprops={'linewidth': 1.5},
@@ -57,6 +46,7 @@ def plot_performance():
             flierprops={'markersize': 2}
             )
 
+        # label x-axis ticks with algorithm names if we are on bottom row
         if (i // 3) == 1:
             axes[i // 3, i % 3].set_xticklabels(
                 perf_data.columns,
@@ -65,19 +55,24 @@ def plot_performance():
             axes[i // 3, i % 3].set_xticklabels(
                 np.repeat('', len(alg_indx)))
 
+        # add y-axis title if we are on left-most column
         if (i % 3) == 0:
             axes[i // 3, i % 3].set_ylabel('AUC', fontsize=19)
         else:
             axes[i // 3, i % 3].set_yticklabels([])
 
-        axes[i // 3, i % 3].set_title(gene_lbl, fontsize=16)
+        # add dotted line at AUC=0.5, set AUC axis limits
         axes[i // 3, i % 3].plot(
             list(range(len(alg_indx)+2)), np.repeat(0.5, len(alg_indx)+2),
             c="black", lw=0.8, ls='--', alpha=0.8)
         axes[i // 3, i % 3].set_ylim(auc_min, 1.0)
 
+    # tweak subplot spacing and save plot to file
     plt.tight_layout(w_pad=-1.2, h_pad=1.5)
-    plt.savefig(base_dir + '/plots/performance.png', dpi=700)
+    plt.savefig(base_dir + '/plots/'
+                + get_set_plotlbl(clf_set) + '_' + get_set_plotlbl(mtype_set)
+                + '__performance.png',
+                dpi=700)
 
 
 def plot_base(label):

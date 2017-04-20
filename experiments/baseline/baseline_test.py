@@ -8,11 +8,9 @@ This file contains a series of baseline tests of classifier performance.
 # Author: Michal Grzadkowski <grzadkow@ohsu.edu>
 
 import sys
-sys.path += ['/home/users/grzadkow/compbio/scripts']
-
+sys.path += ['/home/users/grzadkow/compbio/scripts/']
 from HetMan.cohorts import Cohort
-from HetMan.mutation import MuType
-import HetMan.classifiers as classif
+from HetMan.experiments.baseline.config import mtype_list, clf_list
 
 import pickle
 import time
@@ -24,27 +22,8 @@ def main(argv):
     syn = synapseclient.Synapse()
     syn.login('grzadkow', 'W0w6g1i8A')
 
-    # which mutations we want to consider in our test
-    mtypes = (
-        ('BRCA', MuType({('Gene', 'TP53'):
-                         {('Form', 'Missense_Mutation'): None}})),
-        ('BRCA', MuType({('Gene', 'PIK3CA'):
-                         {('Protein', 'p.H1047R'): None}})),
-        ('BRCA', MuType({('Gene', 'CDH1'):
-                         {('Form', ('Frame_Shift_Ins', 'Frame_Shift_Del')):
-                          None}})),
-        ('SKCM', MuType({('Gene', 'BRAF'):
-                         {('Protein', 'p.V600E'): None}})),
-        ('COAD', MuType({('Gene', 'TTN'):
-                         {('Form', 'Intron'): None}})),
-        ('UCEC', MuType({('Gene', 'PTEN'):
-                         {('Form', ('Frame_Shift_Del', 'Nonsense_Mutation')):
-                          None}})),
-        )
-
-    # which classifiers we want to consider in our test
-    clf_list = [classif.NaiveBayes, classif.Lasso,
-                classif.SVCrbf, classif.rForest]
+    clfs = clf_list[argv[0]]
+    mtypes = mtype_list[argv[1]]
     scores = {}
     times = {}
 
@@ -60,11 +39,8 @@ def main(argv):
             cv_info={'Prop':2/3.0, 'Seed':int(argv[-1])+1})
 
 
-        for clf in clf_list:
-            clf_lbl = clf.__name__
-
+        for clf in clfs:
             for mut_gene, mtype in zip(coh_genes, coh_mtypes):
-                mut_lbl = coh + '_' + mut_gene
 
                 # tune the hyper-parameters of the classifier using the
                 # training samples
@@ -76,13 +52,15 @@ def main(argv):
 
                 # fit the tuned classifier and score using the testing samples
                 cdata.fit_clf(clf_obj, mtype=mtype)
-                scores[(clf_lbl, mut_lbl)] = cdata.eval_clf(
+                scores[(clf_obj, (coh,mtype))] = cdata.eval_clf(
                     clf_obj, mtype=mtype)
-                times[(clf_lbl, mut_lbl)] = time.time() - start_time
+                times[(clf_obj, (coh,mtype))] = time.time() - start_time
 
+    # saves classifier results to file
     out_file = ('/home/users/grzadkow/compbio/scripts/HetMan/experiments/'
-                'baseline/output/base__run' + argv[-1] + '.p')
-    out_data = {'AUC': scores, 'time': times, 'mtypes': mtypes}
+                'baseline/output/' + argv[0] + '_' + argv[1]
+                + '__run' + argv[-1] + '.p')
+    out_data = {'AUC': scores, 'time': times}
     pickle.dump(out_data, open(out_file, 'wb'))
 
 
