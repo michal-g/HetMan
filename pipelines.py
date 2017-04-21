@@ -11,6 +11,7 @@ and prediction methods into robust pipelines.
 from abc import abstractmethod
 
 from math import log, exp
+from numbers import Number
 from functools import reduce
 from operator import mul
 import dill as pickle
@@ -39,6 +40,11 @@ class MutPipe(Pipeline):
         self.set_params(path_keys=path_keys)
         self.cur_tuning = dict(self.tune_priors)
 
+    def __repr__(self):
+        """Prints the classifier name and path key."""
+        return '{}_{}'.format(
+            type(self).__name__, str(self.get_params()['path_keys']))
+
     def __str__(self):
         """Prints the tuned parameters of the pipeline."""
         param_str = type(self).__name__ + ' with '
@@ -48,7 +54,9 @@ class MutPipe(Pipeline):
             param_str += reduce(
                 lambda x,y: x + ', ' + y,
                 [k + ': ' + '%s' % float('%.4g' % param_list[k])
-                for k in list(self.cur_tuning.keys())]
+                 if isinstance(param_list[k], Number)
+                 else k + ': ' + param_list[k]
+                 for k in self.cur_tuning.keys()]
                 )
         else:
             param_str += 'no tuned parameters.'

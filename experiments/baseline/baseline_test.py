@@ -10,7 +10,7 @@ This file contains a series of baseline tests of classifier performance.
 import sys
 sys.path += ['/home/users/grzadkow/compbio/scripts/']
 from HetMan.cohorts import Cohort
-from HetMan.experiments.baseline.config import mtype_list, clf_list
+from HetMan.experiments.baseline.config import *
 
 import pickle
 import time
@@ -38,7 +38,6 @@ def main(argv):
             mut_levels=['Gene', 'Form', 'Protein'],
             cv_info={'Prop':2/3.0, 'Seed':int(argv[-1])+1})
 
-
         for clf in clfs:
             for mut_gene, mtype in zip(coh_genes, coh_mtypes):
 
@@ -52,9 +51,9 @@ def main(argv):
 
                 # fit the tuned classifier and score using the testing samples
                 cdata.fit_clf(clf_obj, mtype=mtype)
-                scores[(clf_obj, (coh,mtype))] = cdata.eval_clf(
+                scores[(repr(clf_obj), (coh,mtype))] = cdata.eval_clf(
                     clf_obj, mtype=mtype)
-                times[(clf_obj, (coh,mtype))] = time.time() - start_time
+                times[(repr(clf_obj), (coh,mtype))] = time.time() - start_time
 
     # saves classifier results to file
     out_file = ('/home/users/grzadkow/compbio/scripts/HetMan/experiments/'

@@ -21,14 +21,17 @@ mtype_list = {
         ('BRCA', MuType({('Gene', 'CDH1'):
                          {('Form', ('Frame_Shift_Ins', 'Frame_Shift_Del')):
                           None}})),
-        ('SKCM', MuType({('Gene', 'BRAF'):
-                         {('Protein', 'p.V600E'): None}})),
-        ('COAD', MuType({('Gene', 'TTN'):
-                         {('Form', 'Intron'): None}})),
-        ('UCEC', MuType({('Gene', 'PTEN'):
-                         {('Form', ('Frame_Shift_Del', 'Nonsense_Mutation')):
-                          None}})),
         ),
+    }
+
+# list of possible feature selection methods based on neighbourhoods
+# in the Pathway Commons graph
+key_list = {
+    'All': None,
+    'Up': ((['Up'], ()), ),
+    'Neigh': ((['Up', 'Down'], ()), ),
+    'expr': (((), ['controls-expression-of']), ),
+    'Down': ((['Down'], ()), )
     }
 
 

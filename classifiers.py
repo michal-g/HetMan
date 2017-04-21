@@ -24,7 +24,7 @@ from sklearn.svm.base import BaseSVC
 from sklearn.metrics.pairwise import (
     rbf_kernel, check_pairwise_arrays, pairwise_distances)
 
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.naive_bayes import GaussianNB
 from sklearn.linear_model import LogisticRegression, SGDClassifier
 from sklearn.svm import SVC
@@ -43,6 +43,20 @@ class NaiveBayes(ClassPipe):
     def __init__(self, path_keys=None):
         feat_step = PathwaySelect(path_keys=path_keys)
         norm_step = StandardScaler()
+        fit_step = GaussianNB()
+        ClassPipe.__init__(self,
+            [('feat', feat_step), ('norm', norm_step), ('fit', fit_step)],
+            path_keys)
+
+
+class RobustNB(ClassPipe):
+    """A class corresponding to Gaussian Naive Bayesian classification
+       of mutation status with robust feature scaling.
+    """
+
+    def __init__(self, path_keys=None):
+        feat_step = PathwaySelect(path_keys=path_keys)
+        norm_step = RobustScaler()
         fit_step = GaussianNB()
         ClassPipe.__init__(self,
             [('feat', feat_step), ('norm', norm_step), ('fit', fit_step)],
@@ -108,14 +122,35 @@ class Ridge(ClassPipe):
             path_keys)
 
 
-class SVCrbf(ClassPipe):
+class SVCpoly(ClassPipe):
     """A class corresponding to C-support vector classification
        of mutation status with a radial basis kernel.
     """
    
     tune_priors = (
         ('fit__C', stats.lognorm(scale=exp(-1), s=exp(1))),
-        ('fit__gamma', stats.lognorm(scale=1e-5, s=exp(2)))
+        ('fit__coef0', [-2., -1., -0.5, 0., 0.5, 1., 2.]),
+    )
+
+    def __init__(self, path_keys=None):
+        feat_step = PathwaySelect(path_keys=path_keys)
+        norm_step = StandardScaler()
+        fit_step = SVC(
+            kernel='poly', probability=True, degree=2,
+            cache_size=500, class_weight='balanced')
+        ClassPipe.__init__(self,
+            [('feat', feat_step), ('norm', norm_step), ('fit', fit_step)],
+            path_keys)
+
+
+class SVCrbf(ClassPipe):
+    """A class corresponding to C-support vector classification
+       of mutation status with a radial basis kernel.
+    """
+   
+    tune_priors = (
+        ('fit__C', stats.lognorm(scale=exp(-1), s=exp(2))),
+        ('fit__gamma', stats.lognorm(scale=1e-4, s=exp(2)))
     )
 
     def __init__(self, path_keys=None):

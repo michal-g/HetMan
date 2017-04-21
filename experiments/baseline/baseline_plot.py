@@ -17,9 +17,11 @@ import matplotlib.patches as mpatches
 
 
 def plot_performance(clf_set='base', mtype_set='default'):
+    """Plots barplots of classifier performance for a set of mutations."""
     out_data = load_output('baseline', clf_set, mtype_set)
     alg_order = [clf.__name__ for clf in clf_list[clf_set]]
 
+    # gets AUC data, sets up plot and subplots
     auc_data = [x['AUC'] for x in out_data]
     auc_min = min([min(x.values()) for x in auc_data]) * 0.9
     fig, axes = plt.subplots(nrows=2, ncols=3, figsize=(7,11))
@@ -28,9 +30,9 @@ def plot_performance(clf_set='base', mtype_set='default'):
 
         # cast performance data into matrix format
         perf_data = pd.DataFrame(
-            [{type(k[0]).__name__:v for k,v in x.items() if k[1] == gene}
+            [{k[0].split('_')[0]:v for k,v in x.items() if k[1] == gene}
              for x in auc_data])
-        alg_indx = [alg_order.index(x) for x in perf_data.columns]
+        alg_indx = [list(perf_data.columns).index(x) for x in alg_order]
         perf_data = perf_data.ix[:, alg_indx]
 
         # create and plot the subplot titles describing mutation types
