@@ -6,13 +6,14 @@ This file contains unit tests for classifiers and regressors.
 
 # Author: Michal Grzadkowski <grzadkow@ohsu.edu>
 
+import numpy as np
+import pandas as pd
+
 from .cohorts import Cohort
 from .kbtl import KBTL, MultiClf
 from .mutation import MuType
 
 import pytest
-import numpy as np
-import pandas as pd
 import pickle
 import sys
 import synapseclient

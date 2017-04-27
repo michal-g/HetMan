@@ -18,14 +18,18 @@ from functools import reduce
 from scipy.stats import fisher_exact
 import random
 
-from sklearn.model_selection import (
-    StratifiedShuffleSplit, cross_val_score)
-from sklearn.model_selection._split import (
-    _validate_shuffle_split, _approximate_mode)
-from sklearn.metrics import roc_auc_score
+from sklearn.base import is_classifier, clone
+from sklearn.externals.joblib import Parallel, delayed
 from sklearn.utils import indexable, check_random_state, safe_indexing
 from sklearn.utils.validation import check_array, _num_samples
 from sklearn.utils.fixes import bincount
+
+from sklearn.model_selection import (
+    StratifiedShuffleSplit, StratifiedKFold, cross_val_score)
+from sklearn.model_selection._split import (
+    _validate_shuffle_split, _approximate_mode)
+from sklearn.model_selection._validation import _fit_and_predict
+from sklearn.metrics import roc_auc_score
 
 
 # .. helper functions ..
@@ -33,6 +37,7 @@ def _safe_load_path(genes):
     """Loads in pathway data from API or local source as available."""
     try:
         pathways = {gn:get_pc2_neighb(gn) for gn in genes}
+
     except HetManDataError:
         print("Defaulting to pathway data stored on file...")
         pathways = parse_sif(genes, get_sif_neighb(
@@ -90,13 +95,14 @@ class Cohort(object):
         Hierarchy of mutations present in the testing samples.
     """
 
-    def _validate_dims(self, 
-                       include_samps=None, exclude_samps=None,
+    def _validate_dims(self,
+                       mtype=None, include_samps=None, exclude_samps=None,
                        gene_list=None, use_test=False):
         if include_samps is not None and exclude_samps is not None:
             raise HetManMutError("Cannot specify samples to be included and"
                                   "samples to be excluded at the same time!")
 
+        # get samples and genes from the specified cohort as specified
         if use_test:
             samps = self.test_samps_
             genes = set(self.test_expr_.columns)
@@ -104,12 +110,17 @@ class Cohort(object):
             samps = self.train_samps_
             genes = set(self.train_expr_.columns)
 
+        # remove samples and/or genes as necessary
         if include_samps is not None:
             samps &= set(include_samps)
         elif exclude_samps is not None:
             samps -= set(exclude_samps)
         if gene_list is not None:
             genes &= set(gene_list)
+
+        # if a mutation type is specified include samples with that mutation
+        if mtype is not None:
+            samps |= mtype.get_samples(self.train_mut_)
 
         return samps, genes
 
@@ -205,6 +216,7 @@ class Cohort(object):
         """
         samps1 = mtype1.get_samples(self.train_mut_)
         samps2 = mtype2.get_samples(self.train_mut_)
+
         if not samps1 or not samps2:
             raise HetManMutError("Both sets must be non-empty!")
         all_samps = set(self.train_expr_.index)
@@ -215,6 +227,7 @@ class Cohort(object):
              [len(samps2 - both_samps),
               len(both_samps)]],
             alternative='less')
+
         return pval
 
     def fit_clf(self, clf, mtype=None, gene_list=None, exclude_samps=None):
@@ -310,7 +323,8 @@ class Cohort(object):
             Performance is measured using the area under the receiver operator
             curve metric.
         """
-        samps, genes = self._validate_dims(exclude_samps=exclude_samps,
+        samps, genes = self._validate_dims(mtype=mtype,
+                                           exclude_samps=exclude_samps,
                                            gene_list=gene_list)
         score_muts = self.train_mut_.mut_vec(clf, samps, mtype)
         score_cvs = MutShuffleSplit(
@@ -326,6 +340,23 @@ class Cohort(object):
             ), 25)
 
         return cv_score
+
+    def infer_clf(self,
+                  clf, mtype, infer_splits=16, gene_list=None,
+                  exclude_samps=None, verbose=False):
+        samps, genes = self._validate_dims(gene_list=gene_list)
+        infer_muts = self.train_mut_.mut_vec(clf, samps, mtype)
+
+        infer_scores = cross_val_predict_mut(
+            estimator=clf, X=self.train_expr_.loc[:, genes], y=infer_muts,
+            exclude_samps=exclude_samps, cv_fold=4, cv_count=infer_splits,
+            fit_params={'feat__mut_genes': list(
+                reduce(lambda x,y: x|y, mtype.child.keys())),
+                        'feat__path_obj': self.path_},
+            random_state=int(self.intern_cv_ ** 1.5) % 42949672, n_jobs=-1
+            )
+
+        return infer_scores
 
     def eval_clf(self, clf, mtype=None, gene_list=None, exclude_samps=None):
         """Evaluate the performance of a classifier."""
@@ -648,7 +679,8 @@ class MutShuffleSplit(StratifiedShuffleSplit):
             mut = [check_array(y, ensure_2d=False, dtype=None)
                       for y in mut]
             n_train_test = [
-                _validate_shuffle_split(n_samps, self.test_size, self.train_size)
+                _validate_shuffle_split(n_samps,
+                                        self.test_size, self.train_size)
                 for n_samps in n_samples]
             class_info = [np.unique(y, return_inverse=True) for y in mut]
             n_classes = [classes.shape[0] for classes,_ in class_info]
@@ -712,5 +744,72 @@ class MutShuffleSplit(StratifiedShuffleSplit):
 
         expr, mut, groups = indexable(expr, mut, groups)
         return self._iter_indices(expr, mut, groups)
+
+
+def cross_val_predict_mut(estimator, X, y=None, groups=None,
+                          exclude_samps=None, cv_fold=4, cv_count=16,
+                          n_jobs=1, verbose=0, fit_params=None,
+                          pre_dispatch='2*n_jobs', random_state=None):
+    """Generates predicted mutation states for samples using internal
+       cross-validation via repeated stratified K-fold sampling.
+    """
+
+    # gets the number of K-fold repeats
+    if (cv_count % cv_fold) != 0:
+        raise ValueError("The number of folds should evenly divide the total"
+                         "number of cross-validation splits.")
+    cv_rep = int(cv_count / cv_fold)
+
+    # checks that the given estimator can predict continuous mutation states
+    if not callable(getattr(estimator, 'predict_proba')):
+        raise AttributeError('predict_proba not implemented in estimator')
+
+    # gets absolute indices for samples to train and test over
+    X, y, groups = indexable(X, y, groups)
+    if exclude_samps is None:
+        exclude_samps = []
+    else:
+        exclude_samps = list(set(exclude_samps) - set(X.index[y]))
+    use_samps = list(set(X.index) - set(exclude_samps))
+    use_samps_indx = X.index.get_indexer_for(use_samps)
+    ex_samps_indx = X.index.get_indexer_for(exclude_samps)
+
+    # generates the training/prediction splits
+    cv_iter = []
+    for i in range(cv_rep):
+        cv = StratifiedKFold(n_splits=cv_fold, shuffle=True,
+                             random_state=(random_state * i) % 12949671)
+        cv_iter += [
+            (use_samps_indx[train],
+             np.append(use_samps_indx[test], ex_samps_indx))
+            for train, test in cv.split(X.ix[use_samps_indx, :],
+                                        np.array(y)[use_samps_indx],
+                                        groups)
+            ]
+
+    # for each split, fit on the training set and get predictions for
+    # remaining cohort
+    parallel = Parallel(n_jobs=n_jobs, verbose=verbose,
+                        pre_dispatch=pre_dispatch)
+    prediction_blocks = parallel(delayed(_fit_and_predict)(
+        clone(estimator), X, y,
+        train, test, verbose, fit_params, 'predict_proba')
+        for train, test in cv_iter)
+
+    # consolidates the predictions into an array
+    pred_mat = [[] for _ in range(X.shape[0])]
+    for i in range(cv_rep):
+        predictions = np.concatenate(
+            [pred_block_i for pred_block_i, _
+             in prediction_blocks[(i*cv_fold):((i+1)*cv_fold)]])
+        test_indices = np.concatenate(
+            [indices_i for _, indices_i
+            in prediction_blocks[(i*cv_fold):((i+1)*cv_fold)]]
+            )
+
+        for j in range(X.shape[0]):
+            pred_mat[j] += list(predictions[test_indices == j, 1])
+        
+    return pred_mat
 
 

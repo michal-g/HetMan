@@ -443,69 +443,24 @@ class MuTree(object):
         """
         if mtype is None:
             mtype = MuType(self.allkey(levels))
+        if levels is None:
+            levels = self.get_levels()
+        mtypes = []
 
-        if levels is None or self.cur_level in levels:
-            mtypes = []
-            for k,v in self.child.items():
-                for l,w in mtype.child.items():
-                    if k in l:
+        if self.cur_level in levels:
+            for nm,mut in self:
+                for k,v in mtype:
+                    if k in nm:
                         new_lvls = list(
                             set(levels) - set([self.cur_level]))
-                        if isinstance(v, MuTree) and len(new_lvls) > 0:
+                        if isinstance(mut, MuTree) and len(new_lvls) > 0:
                             mtypes += [MuType({(self.cur_level, k):s})
-                                       for s in v.subsets(w, new_lvls)]
+                                       for s in mut.subsets(v, new_lvls)]
                         else:
                             mtypes += [MuType({(self.cur_level, k):None})]
         else:
-            mtypes += [v.subsets(mtype, levels)
-                       for k,v in self.child.items()
-                       if isinstance(v, MuTree)]
-        return mtypes
-
-    def direct_subsets(self, mtype, branches=None):
-        """Gets all of the MuTypes corresponding to direct descendants
-           of the given branches of the given mutation set.
-
-        Parameters
-        ----------
-        mtype : MuType
-            A set of mutations whose direct descendants are to be obtained.
-
-        branches : set of strs, optional
-            A set of branches whose subsets are to be obtained, the default is
-            to use all available branches.
-
-        Returns
-        -------
-        mtypes : list
-            A list of MuTypes.
-        """
-        mtypes = []
-        if len(self.levels[1]) > 1:
-            for k,v in list(self.child.items()):
-                for l,w in list(mtype.child.items()):
-                    if k in l:
-                        if w is not None:
-                            mtypes += [MuType({(self.cur_level, k):s})
-                                      for s in v.direct_subsets(w, branches)]
-                        elif branches is None or k in branches:
-                            if isinstance(v, MuTree):
-                                mtypes += [
-                                    MuType({(self.cur_level, k):
-                                            MuType({(v.levels[0], x):None})})
-                                    for x in list(v.child.keys())
-                                    ]
-                            else:
-                                mtypes += [MuType({(self.cur_level, k):None})]
-        else:
-            if branches is None:
-                branches = self.branches_
-            mtypes += [
-                MuType({(self.cur_level, k):None})
-                for k in (set(self.child.keys())
-                          & reduce(lambda x,y: x|y, list(mtype.child.keys()))
-                          & branches)
-                ]
+            mtypes += [mut.subsets(mtype, levels) for _,mut in self
+                       if isinstance(mut, MuTree)]
         return mtypes
 
     def combsets(self,
@@ -536,10 +491,10 @@ class MuTree(object):
         csets : list
             A list of MuTypes satisfying the given criteria.
         """
-        subs = self.subsets(mtype, levels)
+        all_subs = self.subsets(mtype, levels)
         csets = []
         for csize in comb_sizes:
-            for kc in combn(subs, csize):
+            for kc in combn(all_subs, csize):
                 new_set = reduce(lambda x,y: x | y, kc)
                 if len(new_set.get_samples(self)) >= min_size:
                     csets += [new_set]
