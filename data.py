@@ -8,6 +8,11 @@ from sources such as TCGA, ICGC, and Firehose.
 
 # Author: Michal Grzadkowski <grzadkow@ohsu.edu>
 
+import sys
+sys.path += ['/home/users/grzadkow/compbio/software/ophion/client/python/']
+import ophion
+import json
+
 import numpy as np
 import pandas as pd
 
@@ -92,6 +97,25 @@ def get_annot(version='v19'):
 
 
 # .. functions for reading in mRNA expression datasets ..
+def get_expr_bmeg(cohort):
+    """Loads expression data progromatically from BMEG."""
+    oph = ophion.Ophion("http://bmeg.compbio.ohsu.edu")
+    expr_list = {}
+
+    for i in oph.query().has(
+        "gid", "cohort:" + cohort).outgoing(
+            "hasSample").incoming("expressionForSample").execute():
+
+        if 'properties' in i and 'serializedExpressions' in i['properties']:
+            expr_list[i['gid']] = json.loads(
+                i['properties']['serializedExpressions'])
+
+    expr_data = pd.DataFrame(expr_list).transpose().fillna(0.0)
+    expr_data = log_norm_expr(expr_data)
+    expr_data.index = [x[-1] for x in expr_data.index.str.split(':')]
+
+    return expr_data
+
 def get_expr_firehose(cohort):
     """Loads expression data as a matrix from a Firehose GDAC fzile.
        Use ./firehose_get -tasks 'Merge_rnaseqv2__illuminahiseq_rnaseqv2__

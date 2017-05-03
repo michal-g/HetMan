@@ -184,20 +184,30 @@ class Cohort(object):
         # gets subset of samples to use for training
         random.seed(a=cv_info['Seed'])
         self.cv_seed = random.getstate()
-        self.train_samps_ = frozenset(
-            random.sample(population=self.samples,
-                          k=int(round(len(self.samples) * cv_info['Prop'])))
-            )
-        self.test_samps_ = self.samples - self.train_samps_
+        if cv_info['Prop'] < 1.0 and cv_info['Prop'] > 0.0:
+            self.train_samps_ = frozenset(
+                random.sample(
+                    population=self.samples,
+                    k=int(round(len(self.samples) * cv_info['Prop'])))
+                )
+            self.test_samps_ = self.samples - self.train_samps_
+            self.test_expr_ = log_norm_expr(expr.loc[self.test_samps_, :])
+            self.test_mut_ = MuTree(
+                muts=muts.loc[muts['Sample'].isin(self.test_samps_), :],
+                levels=mut_levels)
+
+        elif cv_info['Prop'] == 1:
+            self.train_samps_ = self.samples
+            self.test_samps_ = None
+
+        else:
+            raise ValueError("Improper cross-validation ratio that is"
+                             "not > 0 and <= 1.0")
 
         # creates training and testing expression and mutation datasets
         self.train_expr_ = log_norm_expr(expr.loc[self.train_samps_, :])
-        self.test_expr_ = log_norm_expr(expr.loc[self.test_samps_, :])
         self.train_mut_ = MuTree(
             muts=muts.loc[muts['Sample'].isin(self.train_samps_), :],
-            levels=mut_levels)
-        self.test_mut_ = MuTree(
-            muts=muts.loc[muts['Sample'].isin(self.test_samps_), :],
             levels=mut_levels)
 
     def mutex_test(self, mtype1, mtype2):
