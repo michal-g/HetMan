@@ -72,10 +72,10 @@ dependencies:
 - xz=5.2.2=1
 - zlib=1.2.8=3
 - backports.csv=1.0.1=py35_0
-- bioservices=1.4.10=py35_1
-- easydev=0.9.31=py35_1
 - grequests=0.3.0=py35_1
 - synapseclient=1.5=py35_0
+- fuzzywuzzy=0.15.0=py35_0
+- python-levenshtein=0.12.0=py35_0
 - requests-cache=0.4.12=py35_0
 - py=1.4.32=py35_0
 - atk=1.28.0=0

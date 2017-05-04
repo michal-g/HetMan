@@ -32,21 +32,6 @@ from sklearn.model_selection._validation import _fit_and_predict
 from sklearn.metrics import roc_auc_score
 
 
-# .. helper functions ..
-def _safe_load_path(genes):
-    """Loads in pathway data from API or local source as available."""
-    try:
-        pathways = {gn:get_pc2_neighb(gn) for gn in genes}
-
-    except HetManDataError:
-        print("Defaulting to pathway data stored on file...")
-        pathways = parse_sif(genes, get_sif_neighb(
-            '/home/users/grzadkow/compbio/input-data/'
-            'babur-mutex/data-tcga/Network.sif'))
-
-    return pathways
-
-
 class HetManCohortError(Exception):
     pass
 
@@ -139,8 +124,9 @@ class Cohort(object):
         expr = get_expr_firehose(cohort)
         muts = get_mut_mc3(syn)
         cnvs = get_cnv_firehose(cohort)
-        if load_path:
-            self.path_ = _safe_load_path(mut_genes)
+        self.path_ = parse_sif(mut_genes, get_sif_neighb(
+            '/home/users/grzadkow/compbio/input-data/'
+            'PathwayCommons9.All.hgnc.sif.gz'))
 
         # filters out genes that are not expressed in any samples, don't have
         # any variation across the samples, are not included in the

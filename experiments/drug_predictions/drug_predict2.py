@@ -57,42 +57,82 @@ def main(argv):
         drug_ints['DRUG'][pnt_indx][drug_ints['FEAT'][pnt_indx].
                                     isin(pnt_muts.keys())]))
 
-    # create arrays to store output data
+    # array that stores classifier performance on held-out cell lines ...
     response_vec = pd.Series(float('nan'), index=pnt_drugs)
+
+    # ... stores predicted drug response for organoid sample ...
+    predict_vec = pd.Series(float('nan'), index=pnt_drugs)
+
+    # ... stores trained classifier instances ...
+    clf_vec = {}
+
+    # ... stores t-test p-values for mutation state vs predicted
+    # drug responses in TCGA cohort ...
     resp_mat = pd.DataFrame(float('nan'),
                             index=pnt_drugs, columns=pnt_muts.keys())
+
+    # ... stores AUC scores for mutation vs drug response in TCGA ...
     auc_mat = pd.DataFrame(float('nan'),
                            index=pnt_drugs, columns=pnt_muts.keys())
+
+    # loads organoid RNAseq data
+    pred_data = pd.read_csv(
+        '/home/users/grzadkow/compbio/input-data/rnaseq_4315.csv',
+        header=0)
 
     for drug in pnt_drugs:
         print("Testing drug " + drug + " ....")
         drug_clf = eval(argv[1])()
+
+        # loads cell line drug response and array expression data
         coh = DrugCohort(drug, source='ioria', random_state=int(argv[-1]))
         cdata.train_expr_ = deepcopy(cdata_expr)
+        use_genes = (set(cdata.train_expr_.columns)
+                     & set(coh.drug_expr.columns))
 
-        use_genes = list(set(cdata.train_expr_.columns)
-                         & set(coh.drug_expr.columns))
+        # processes organoid RNAseq data to match TCGA and drug response data
+        pred_samp = pred_data.ix[pred_data['Symbol'].isin(use_genes), :]
+        pred_samp.loc[:, 'RPKM'] = (
+            pred_samp.loc[:, 'RPKM']
+            + min(pred_samp.loc[:, 'RPKM'][pred_samp.loc[:,'RPKM'] > 0]) / 2)
+        pred_samp = pred_samp.groupby(['Symbol'])['RPKM'].mean()
+        pred_samp = exp_norm(pd.DataFrame(pred_samp).transpose())
+
+        use_genes &= set(pred_samp.columns)
         cdata.train_expr_ = cdata.train_expr_.loc[:, use_genes]
         coh.drug_expr = coh.drug_expr.loc[:, use_genes]
+        pred_samp = pred_samp.loc[:, use_genes]
 
+        # tunes and fits the classifier on the CCLE data, and evaluates its
+        # performance on the held-out samples
         coh.tune_clf(drug_clf)
         coh.fit_clf(drug_clf)
         response_vec[drug] = coh.eval_clf(drug_clf)
 
+        # predicts drug response for the organoid, stores classifier
+        # for later use
+        predict_vec[drug] = drug_clf.predict(pred_samp)[0]
+        clf_vec[drug] = drug_clf
+
         for gn, mtype in pnt_muts.items():
+            # for each mutated gene, get the vector of mutation status
+            # for the TCGA samples
             mut_stat = np.array(
                 cdata.train_mut_.status(cdata.train_expr_.index,
                                         mtype=mtype)
                 )
-            tcga_pred = drug_clf.predict(cdata.train_expr_)
 
+            # gets the classifier's predictions of drug response for the
+            # TCGA cohort, and evaluate its concordance with mutation status
+            tcga_pred = drug_clf.predict(cdata.train_expr_)
             resp_mat.loc[drug, gn] = -log10(
                 ttest_ind(tcga_pred[mut_stat], tcga_pred[~mut_stat],
                           equal_var=False)[1]
                 )
             auc_mat.loc[drug, gn] = roc_auc_score(mut_stat, tcga_pred)
 
-    out_data = {'Response': response_vec,
+    # save everything to file
+    out_data = {'Response': response_vec, 'Pred': predict_vec, 'Clf': clf_vec,
                 'T-Test': resp_mat, 'AUC': auc_mat}
     out_file = ('/home/users/grzadkow/compbio/scripts/HetMan/experiments/'
                 'drug_predictions/output/mat_' + argv[0] + '_' + argv[1]

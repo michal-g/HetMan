@@ -19,8 +19,6 @@ import pandas as pd
 from re import sub as gsub
 from itertools import groupby
 from functools import reduce
-from bioservices import PathwayCommons 
-from time import sleep
 
 
 # .. directories containing raw -omics data and cross-validation samples ..
@@ -296,50 +294,6 @@ def get_cnv_firehose(cohort):
     cnv_data.columns = parse_tcga_barcodes(cnv_data.columns)
 
     return cnv_data.T
-
-
-# .. functions for reading in pathway data ..
-def get_pc2_neighb(gene, verbose=False):
-    """Downloads Pathway Commons neighbourhood for a given gene using
-       the PC API.
-    """
-    pc2 = PathwayCommons(verbose=verbose)
-    pc2.settings.TIMEOUT = 1000
-    neighb = {}
-
-    # runs the PC2 query, makes sure the output has the correct format
-    raw_data = 0
-    i = 0
-    while isinstance(raw_data, int) and i < 5:
-        if verbose:
-            print("Reading in Pathway Commons data for gene "
-                  + gene + "...")
-        # sets the parameters of the PC2 query
-        url = 'graph'
-        try:
-            gene_id = pc2.idmapping(gene)[gene]
-            params = {'format': 'BINARY_SIF',
-                      'kind': 'neighborhood',
-                      'limit': 1,
-                      'source': ('http://identifiers.org/uniprot/'
-                                 + gene_id)
-                     }
-            raw_data = pc2.http_get(url, frmt=None, params=params)
-
-        except:
-            if verbose:
-                print("Reading in PC data failed for gene "
-                      + gene + ", trying again...")
-            i += 1
-            sleep(5)
-
-    if isinstance(raw_data, int):
-        raise HetManDataError("Could not access PC2 API!")
-
-    # parses interaction data according to direction
-    sif_data = raw_data.splitlines()
-    sif_data = [x.split() for x in sif_data]
-    return sif_data
 
 
 def get_sif_neighb(sif_file):
